@@ -774,6 +774,11 @@ impl TextureHeapTimer {
     pub(crate) fn phase(counter: &'static AtomicU64) -> Option<Self> {
         TEXTURE_HEAP_TIMING.get().then(|| Self { started: std::time::Instant::now(), counter, previous_pass: None })
     }
+
+    pub(crate) fn sampled(counter: &'static AtomicU64) -> Option<Self> {
+        crate::residency::sampling_enabled()
+            .then(|| Self { started: std::time::Instant::now(), counter, previous_pass: None })
+    }
 }
 
 impl Drop for TextureHeapTimer {
@@ -2977,7 +2982,10 @@ impl State {
             // The first upload of a texture no list has used: on a queue of
             // its own, and the slot shows it as soon as that has run.
             let ahead = if late && !tabled && texture.is_some_and(crate::pool::fresh) {
-                crate::texture::ahead::take(resource, first, there.filter(|_| partly.is_none()).unwrap_or(u64::MAX))
+                let previous_bake = crate::texture::BAKE_UPLOAD_CONTEXT.replace(required);
+                let ahead = crate::texture::ahead::take(resource, first, there.filter(|_| partly.is_none()).unwrap_or(u64::MAX));
+                crate::texture::BAKE_UPLOAD_CONTEXT.set(previous_bake);
+                ahead
             } else {
                 None
             };

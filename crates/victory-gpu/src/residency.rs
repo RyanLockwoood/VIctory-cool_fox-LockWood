@@ -90,6 +90,17 @@ pub(crate) fn allow_staging_growth(bake: bool) -> bool {
     has_growth_reserve(sample_commit(now), bake)
 }
 
+pub(crate) fn defer_speculative_buffer_growth() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    crate::texture::PICKING.get().is_some()
+        && !crate::texture::BAKING.get()
+        && !crate::texture::BAKE_UPLOAD_CONTEXT.get()
+        && *ENABLED.get_or_init(|| std::env::var("VICTORY_SPECULATIVE_COMMIT_GUARD").as_deref() == Ok("1"))
+        && sample_commit(crate::host::coarse_ms()) < 1536 * MIB
+}
+
+pub(crate) static SPECULATIVE_BUFFER_DEFERRALS: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) fn limited_host_ram() -> bool {
     static LIMITED: OnceLock<bool> = OnceLock::new();
     *LIMITED.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
@@ -161,7 +172,7 @@ pub(crate) fn log_sample(video: Option<[u64; 4]>) {
     let (arena, idle_arena) = crate::upload::arena_bytes();
     let [texture_pool, staging_pool] = crate::pool::memory();
     let (texture_occupied, texture_free, texture_empty, texture_resting) = crate::pool::texture_memory();
-    let (retired, oldest_ms) = crate::host::retirement_sample();
+    let (retired, oldest_ms, retired_any, retired_resources) = crate::host::retirement_sample();
     let (started, finished) = crate::host::submissions();
     let queued = crate::queue::queued();
     let os = memory_status();
@@ -185,6 +196,7 @@ pub(crate) fn log_sample(video: Option<[u64; 4]>) {
         texture_pool_empty_heaps_mib = texture_empty / MIB,
         texture_pool_resting_mib = texture_resting / MIB,
         staging_pool_mib = staging_pool,
+        staging_idle_limit_blocks = crate::pool::STAGING_IDLE_LIMIT.load(Ordering::Relaxed),
         live_staging_mib = crate::texture::live_staging_bytes() / MIB,
         texture_recorded_upload_bytes = crate::texture::UPLOAD_TRAFFIC[0].load(Ordering::Relaxed),
         texture_prefetch_upload_bytes = crate::texture::UPLOAD_PATH_BYTES[crate::texture::UploadPath::Prefetch as usize].load(Ordering::Relaxed),
@@ -199,6 +211,15 @@ pub(crate) fn log_sample(video: Option<[u64; 4]>) {
         texture_staging_lock_wait_us = crate::texture::STAGING_LOCK_WAIT_US.load(Ordering::Relaxed),
         texture_staging_footprint_us = crate::texture::STAGING_FOOTPRINT_US.load(Ordering::Relaxed),
         texture_staging_buffer_us = crate::texture::STAGING_BUFFER_US.load(Ordering::Relaxed),
+        texture_staging_pool_lock_us = crate::pool::STAGING_POOL_LOCK_US.load(Ordering::Relaxed),
+        texture_staging_pool_growth_us = crate::pool::STAGING_POOL_GROWTH_US.load(Ordering::Relaxed),
+        texture_staging_pool_clear_us = crate::pool::STAGING_POOL_CLEAR_US.load(Ordering::Relaxed),
+        texture_staging_dedicated_us = crate::texture::STAGING_DEDICATED_US.load(Ordering::Relaxed),
+        staging_speculative_pool_alloc_us = crate::texture::STAGING_POOL_ALLOCATIONS_US[0].load(Ordering::Relaxed),
+        staging_demand_pool_alloc_us = crate::texture::STAGING_POOL_ALLOCATIONS_US[1].load(Ordering::Relaxed),
+        staging_speculative_dedicated_alloc_us = crate::texture::STAGING_DEDICATED_ALLOCATIONS_US[0].load(Ordering::Relaxed),
+        staging_demand_dedicated_alloc_us = crate::texture::STAGING_DEDICATED_ALLOCATIONS_US[1].load(Ordering::Relaxed),
+        speculative_buffer_deferrals = SPECULATIVE_BUFFER_DEFERRALS.load(Ordering::Relaxed),
         submission_prepare_us = crate::host::STALL_TIMING_US[0].load(Ordering::Relaxed),
         submitter_wait_us = crate::host::STALL_TIMING_US[1].load(Ordering::Relaxed),
         relay_fence_wait_us = crate::host::STALL_TIMING_US[2].load(Ordering::Relaxed),
@@ -207,6 +228,8 @@ pub(crate) fn log_sample(video: Option<[u64; 4]>) {
         buffer_mirror_span_mib = crate::shadow::live_span_bytes() / MIB,
         spare_scratch_mib = crate::host::ALIVE[4].load(Ordering::Relaxed) / MIB,
         retired,
+        retired_any,
+        retired_resources,
         oldest_retired_ms = oldest_ms,
         queued,
         started,
@@ -220,6 +243,14 @@ pub(crate) fn log_sample(video: Option<[u64; 4]>) {
 pub(crate) fn critical_commit() -> bool {
     let now = crate::host::coarse_ms();
     now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) || sample_commit(now) < 1536 * MIB
+}
+
+/// A single warm staging block can be kept through moderate commit pressure.
+pub(crate) fn keep_staging_reserve() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("VICTORY_STAGING_RESERVE").as_deref() == Ok("1"))
+        && !upload_refused()
+        && sample_commit(crate::host::coarse_ms()) >= 512 * MIB
 }
 
 /// Enables extra texture eviction after three seconds below the commit reserve.

@@ -475,6 +475,19 @@ static STAGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::A
 pub(crate) static STAGING_LOCK_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static STAGING_FOOTPRINT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static STAGING_BUFFER_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static STAGING_DEDICATED_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Speculative and demand allocation time, including calls outside heap passes.
+pub(crate) static STAGING_POOL_ALLOCATIONS_US: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+pub(crate) static STAGING_DEDICATED_ALLOCATIONS_US: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+pub(crate) fn staging_allocation_timer(
+    counters: &'static [std::sync::atomic::AtomicU64; 2],
+) -> Option<crate::draw::TextureHeapTimer> {
+    let speculative = PICKING.get().is_some() && !BAKING.get() && !BAKE_UPLOAD_CONTEXT.get();
+    crate::draw::TextureHeapTimer::sampled(&counters[usize::from(!speculative)])
+}
 
 /// Cumulative regular-list upload bytes, first uploads after eviction, and their bytes.
 pub(crate) static UPLOAD_TRAFFIC: [std::sync::atomic::AtomicU64; 3] =
@@ -1940,12 +1953,19 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data),
         None => {
             let speculative = PICKING.get().is_some() && !BAKING.get();
+            if crate::residency::defer_speculative_buffer_growth() {
+                crate::residency::SPECULATIVE_BUFFER_DEFERRALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::residency::note_staging_deferred();
+                return None;
+            }
             if crate::residency::upload_refused()
                 || (speculative && !crate::residency::allow_staging_growth(false))
             {
                 crate::residency::note_staging_deferred();
                 return None;
             }
+            let _dedicated_timer = crate::draw::TextureHeapTimer::phase(&STAGING_DEDICATED_US);
+            let _caller_timer = staging_allocation_timer(&STAGING_DEDICATED_ALLOCATIONS_US);
             let (buffer, data) = host.upload_buffer(total)?;
             crate::host::name(&buffer, || {
                 format!(

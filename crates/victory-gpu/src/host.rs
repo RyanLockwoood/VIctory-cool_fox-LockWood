@@ -5,7 +5,7 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -76,6 +76,9 @@ unsafe impl Sync for Host {}
 /// runs a submission: freeing there is a GPU page fault on the freed
 /// texture (a device hang).
 static RETIRED: Mutex<std::collections::VecDeque<Retirement>> = Mutex::new(std::collections::VecDeque::new());
+/// Objects waiting for in-flight submissions, split without scanning the queue.
+static RETIRED_ANY: AtomicUsize = AtomicUsize::new(0);
+static RETIRED_RESOURCES: AtomicUsize = AtomicUsize::new(0);
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -463,15 +466,27 @@ fn sweep() {
 }
 
 /// Queue depth and time since the oldest remaining retirement was enqueued.
-pub(crate) fn retirement_sample() -> (usize, Option<u64>) {
+pub(crate) fn retirement_sample() -> (usize, Option<u64>, usize, usize) {
     let retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
     let oldest_ms = retired.front().map(|entry| coarse_ms().saturating_sub(entry.queued_ms));
-    (retired.len(), oldest_ms)
+    (
+        retired.len(),
+        oldest_ms,
+        RETIRED_ANY.load(Ordering::Relaxed),
+        RETIRED_RESOURCES.load(Ordering::Relaxed),
+    )
 }
 
 fn enqueue_retirement(submission: u64, object: Retired) {
     let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
-    let queued_ms = if crate::residency::sampling_enabled() { coarse_ms() } else { 0 };
+    let sampling = crate::residency::sampling_enabled();
+    if sampling {
+        match &object {
+            Retired::Any(_) => RETIRED_ANY.fetch_add(1, Ordering::Relaxed),
+            Retired::Resource(_) => RETIRED_RESOURCES.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+    let queued_ms = if sampling { coarse_ms() } else { 0 };
     retired.push_back(Retirement { submission, queued_ms, _object: object });
 }
 
@@ -530,9 +545,26 @@ fn bury(finished: u64) {
     let finished = finished.saturating_sub(bury_lag());
     let done: Vec<Retirement> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
-        let n = retired.iter().take_while(|entry| entry.submission <= finished).count();
+        let sampling = crate::residency::sampling_enabled();
+        let mut n = 0;
+        let mut any = 0;
+        if sampling {
+            for entry in &*retired {
+                if entry.submission > finished {
+                    break;
+                }
+                n += 1;
+                any += usize::from(matches!(&entry._object, Retired::Any(_)));
+            }
+        } else {
+            n = retired.iter().take_while(|entry| entry.submission <= finished).count();
+        }
         if n == 0 {
             return;
+        }
+        if sampling {
+            RETIRED_ANY.fetch_sub(any, Ordering::Relaxed);
+            RETIRED_RESOURCES.fetch_sub(n - any, Ordering::Relaxed);
         }
         retired.drain(..n).collect()
     };

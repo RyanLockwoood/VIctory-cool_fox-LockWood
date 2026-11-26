@@ -53,12 +53,13 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     }
     if let Ok(mut pool) = STAGING.try_lock() {
         let staging_limit = if crate::residency::critical_commit() {
-            0
+            usize::from(crate::residency::keep_staging_reserve())
         } else if pressure {
             1
         } else {
             limit
         };
+        STAGING_IDLE_LIMIT.store(staging_limit.min(STAGING_KEPT), Ordering::Relaxed);
         pool.reclaim(tick, staging_limit, true);
     }
 }
@@ -208,8 +209,9 @@ impl<B: Clone> Pool<B> {
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
     /// part was ever used before; `make` makes a block when none has room.
+    #[cfg(test)]
     fn take(&mut self, len: u64, align: u64, now: u64, make: impl FnMut() -> Option<B>) -> Option<(Piece, B, bool)> {
-        self.take_ripe(len, align, now, Ripe::ALL, make)
+        self.take_ripe(len, align, now, Ripe::ALL, true, make)
     }
 
     /// The same from a block that is ripe, if one has room; `make` makes one
@@ -220,6 +222,7 @@ impl<B: Clone> Pool<B> {
         align: u64,
         now: u64,
         ripe: Ripe,
+        allow_growth: bool,
         mut make: impl FnMut() -> Option<B>,
     ) -> Option<(Piece, B, bool)> {
         // With blocks made ahead, what would be an allocation of its own (and
@@ -249,6 +252,7 @@ impl<B: Clone> Pool<B> {
         // small texture. Existing free ranges remain usable during backoff.
         let (i, start) = match found {
             Some(found) => found,
+            None if !allow_growth => return None,
             None => {
                 let memory = self.grow(now, &mut make)?;
                 let i = self.add(memory, ripe.started);
@@ -263,7 +267,7 @@ impl<B: Clone> Pool<B> {
                 }
             }
             let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
-            if empty < ripe.ahead
+            if allow_growth && empty < ripe.ahead
                 && let Some(memory) = self.grow(now, &mut make)
             {
                 self.add(memory, ripe.started);
@@ -401,7 +405,11 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     }
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
+    let lock_timer = crate::draw::TextureHeapTimer::phase(&STAGING_POOL_LOCK_US);
+    let mut pool = lock(&STAGING);
+    drop(lock_timer);
+    let allow_growth = !crate::residency::defer_speculative_buffer_growth();
+    let allocation = pool.take_ripe(bytes, 512, now(), Ripe::ALL, allow_growth, || {
         // Only gate speculative bindless prefetch on staging-pool growth
         // headroom; table-bound textures and decoration bakes are sampled
         // immediately and would otherwise read uninitialized/reused VRAM.
@@ -409,14 +417,19 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         if speculative && !crate::residency::allow_staging_growth(false) {
             return None;
         }
+        let _growth_timer = crate::draw::TextureHeapTimer::phase(&STAGING_POOL_GROWTH_US);
+        let _caller_timer = crate::texture::staging_allocation_timer(&crate::texture::STAGING_POOL_ALLOCATIONS_US);
         let (buffer, data) = host.upload_buffer(BLOCK)?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
-    })?;
+    });
+    drop(pool);
+    let (piece, memory, again) = allocation?;
     let owned = StagingPiece(piece);
     // SAFETY: the piece lies in the block's mapping.
     let data = unsafe { memory.1.add(piece.start as usize) };
     if again {
+        let _clear_timer = crate::draw::TextureHeapTimer::phase(&STAGING_POOL_CLEAR_US);
         // What is not detiled into it (an unmapped texture) uploads zeros,
         // as from a buffer of its own.
         // SAFETY: the piece is ours alone.
@@ -424,6 +437,11 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     }
     Some((owned, memory.0, piece.start, data))
 }
+
+pub(crate) static STAGING_POOL_LOCK_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static STAGING_IDLE_LIMIT: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static STAGING_POOL_GROWTH_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static STAGING_POOL_CLEAR_US: AtomicU64 = AtomicU64::new(0);
 
 /// An object the host texture holds and releases when it goes: its piece
 /// is free then.
@@ -538,7 +556,7 @@ pub(crate) unsafe fn texture(
         return None;
     }
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), true, || {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -622,6 +640,16 @@ mod tests {
     }
 
     #[test]
+    fn growth_guard_reuses_blocks_and_leaves_growth_available_for_required_work() {
+        let mut pool = Pool::new(SPARE);
+        assert!(pool.take(BLOCK / 2, 1, 0, || Some(1)).is_some());
+        let refuse_call = || panic!("growth was disabled");
+        assert!(pool.take_ripe(BLOCK / 2, 1, 0, Ripe::ALL, false, refuse_call).is_some());
+        assert!(pool.take_ripe(BLOCK / 2, 1, 0, Ripe::ALL, false, refuse_call).is_none());
+        assert!(pool.take(BLOCK / 2, 1, 0, || Some(2)).is_some());
+    }
+
+    #[test]
     fn a_failed_block_is_not_retried_for_each_small_upload() {
         let mut pool: Pool<u32> = Pool::new(2);
         let calls = std::cell::Cell::new(0);
@@ -700,7 +728,7 @@ mod tests {
             Some(made.get())
         };
         let at = |started, finished| Ripe { started, finished, ahead: 2 };
-        let take = |pool: &mut Pool<u64>, ripe| pool.take_ripe(BLOCK / 2, 65536, 0, ripe, make).unwrap().1;
+        let take = |pool: &mut Pool<u64>, ripe| pool.take_ripe(BLOCK / 2, 65536, 0, ripe, true, make).unwrap().1;
         // Nothing runs: at once, and two are made ahead, one a time.
         assert_eq!(take(&mut pool, at(0, 0)), 1);
         assert_eq!(made.get(), 2);
@@ -716,7 +744,7 @@ mod tests {
         assert_eq!(take(&mut pool, at(7, 4)), 4);
         assert_eq!(take(&mut pool, at(7, 5)), 4);
         // A whole block's worth too.
-        assert_eq!(pool.take_ripe(BLOCK, 65536, 0, at(8, 7), make).unwrap().1, 5);
+        assert_eq!(pool.take_ripe(BLOCK, 65536, 0, at(8, 7), true, make).unwrap().1, 5);
         // Off: the first with room, whatever its age, none ahead.
         let n = made.get();
         assert_eq!(pool.take(BLOCK / 2, 65536, 0, make).unwrap().1, 6);
