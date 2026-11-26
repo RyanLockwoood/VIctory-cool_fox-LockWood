@@ -18,6 +18,7 @@ fn memory_status() -> Option<MEMORYSTATUSEX> {
 // The texture sweep may run for seconds inside a single submitted frame.
 static NEXT_COMMIT_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static AVAILABLE_COMMIT: AtomicU64 = AtomicU64::new(u64::MAX);
+static AVAILABLE_PHYSICAL: AtomicU64 = AtomicU64::new(u64::MAX);
 static RETRY_UPLOAD_AT: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn allocation_error(error: &windows::core::Error) {
@@ -51,8 +52,15 @@ fn sample_commit(now: u64) -> u64 {
         && let Some(status) = memory_status()
     {
         AVAILABLE_COMMIT.store(status.ullAvailPageFile, Ordering::Relaxed);
+        AVAILABLE_PHYSICAL.store(status.ullAvailPhys, Ordering::Relaxed);
     }
     AVAILABLE_COMMIT.load(Ordering::Relaxed)
+}
+
+/// Available physical memory from the same throttled sample as `sample_commit`.
+fn sample_physical(now: u64) -> u64 {
+    sample_commit(now);
+    AVAILABLE_PHYSICAL.load(Ordering::Relaxed)
 }
 
 fn has_upload_reserve(commit: u64, bake: bool) -> bool {
@@ -253,15 +261,25 @@ pub(crate) fn keep_staging_reserve() -> bool {
         && sample_commit(crate::host::coarse_ms()) >= 512 * MIB
 }
 
-/// Enables extra texture eviction after three seconds below the commit reserve.
+/// Low physical memory also starts the trim with `VICTORY_TEXTURE_RAM_TRIM=1`:
+/// with a large page file, commit can stay above its reserve while RAM runs
+/// out (run pagefile-20261126-163448: 268 MiB free RAM, 269 MiB commit).
+fn low_for_trim(commit: u64, physical: u64, ram_trim: bool) -> bool {
+    commit < 1536 * MIB || (ram_trim && physical < 1536 * MIB)
+}
+
+/// Enables extra texture eviction after three seconds below the commit reserve
+/// (or the RAM reserve, see `low_for_trim`).
 pub(crate) fn trim_textures_for_commit() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
+    static RAM: OnceLock<bool> = OnceLock::new();
     static LOW_SINCE: AtomicU64 = AtomicU64::new(0);
     if !*ENABLED.get_or_init(|| std::env::var("VICTORY_TEXTURE_COMMIT_TRIM").as_deref() == Ok("1")) {
         return false;
     }
+    let ram_trim = *RAM.get_or_init(|| std::env::var("VICTORY_TEXTURE_RAM_TRIM").as_deref() == Ok("1"));
     let now = crate::host::coarse_ms().saturating_add(1);
-    if sample_commit(now - 1) >= 1536 * MIB {
+    if !low_for_trim(sample_commit(now - 1), sample_physical(now - 1), ram_trim) {
         LOW_SINCE.store(0, Ordering::Relaxed);
         return false;
     }
@@ -300,6 +318,18 @@ mod tests {
             assert_eq!(has_upload_reserve(commit, false), lookahead);
             assert_eq!(has_growth_reserve(commit, false), growth);
         }
+    }
+
+    #[test]
+    fn low_ram_starts_the_trim_only_when_asked() {
+        // Low commit trims either way.
+        assert!(low_for_trim(1024 * MIB, 16 * GIB, false));
+        assert!(low_for_trim(1024 * MIB, 16 * GIB, true));
+        // Low RAM with plenty of commit (a large page file) only when asked.
+        assert!(!low_for_trim(20 * GIB, 300 * MIB, false));
+        assert!(low_for_trim(20 * GIB, 300 * MIB, true));
+        // Both above their reserves: no trim.
+        assert!(!low_for_trim(20 * GIB, 4 * GIB, true));
     }
 
     #[test]

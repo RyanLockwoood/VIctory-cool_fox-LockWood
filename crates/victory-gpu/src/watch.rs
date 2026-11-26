@@ -192,7 +192,14 @@ pub(crate) fn lock_waits(frames: f64) -> String {
         let [n, ns] = [0, 1].map(|i| WAITS[what][i].swap(0, std::sync::atomic::Ordering::Relaxed));
         format!("{:.0} {:.2} ms", n as f64 / frames, ns as f64 / 1e6 / frames)
     };
-    format!("ranges held {}, journal read {}, journal noted in {}, guards {}", of(0), of(1), of(2), of(3))
+    format!(
+        "ranges held {}, journal read {}, journal noted in {}, guards {}; guards held by line in watch.rs: {}",
+        of(0),
+        of(1),
+        of(2),
+        of(3),
+        held::taken(frames)
+    )
 }
 
 /// The page ranges some thread is asking about: asking forgets what it
@@ -1206,7 +1213,8 @@ pub(crate) fn asks() -> [u64; 13] {
 }
 
 /// The guards' lock, the wait for it counted.
-fn guards_timed() -> std::sync::MutexGuard<'static, Guards> {
+#[cfg_attr(feature = "diagnostics", track_caller)]
+fn guards_timed() -> GuardsHeld {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     let g = guards();
@@ -1425,11 +1433,157 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     opened: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
 });
 
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    if let Ok(g) = GUARDS.try_lock() {
-        return g;
+/// The guards, locked. In diagnostics builds a wrapper that counts how long
+/// each call site holds the lock ([`held`]); otherwise the lock's own guard.
+#[cfg(not(feature = "diagnostics"))]
+type GuardsHeld = std::sync::MutexGuard<'static, Guards>;
+#[cfg(feature = "diagnostics")]
+type GuardsHeld = held::Held;
+
+#[cfg_attr(feature = "diagnostics", track_caller)]
+fn guards() -> GuardsHeld {
+    #[cfg(feature = "diagnostics")]
+    let line = std::panic::Location::caller().line();
+    let g = match GUARDS.try_lock() {
+        Ok(g) => g,
+        Err(_) => waited(3, || spin_for(&GUARDS, guards_spin()).unwrap_or_else(|| GUARDS.lock().unwrap_or_else(|e| e.into_inner()))),
+    };
+    #[cfg(feature = "diagnostics")]
+    let g = held::Held::new(g, line);
+    g
+}
+
+/// How long a thread that finds [`GUARDS`] taken tries again before it
+/// sleeps (`VICTORY_GUARDS_SPIN=<microseconds>`, at most 200; not at all
+/// unless given). Holds are 5 to 20 µs, but threads waited about nine
+/// times the time it was held, most of it being woken and scheduled again
+/// on a busy CPU (run holds-20261126-175010).
+fn guards_spin() -> std::time::Duration {
+    static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_micros(*US.get_or_init(|| {
+        std::env::var("VICTORY_GUARDS_SPIN").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0).min(200)
+    }))
+}
+
+/// `lock`, if it comes free within `limit` of trying again (none: it did
+/// not, or `limit` is zero).
+fn spin_for<T>(lock: &'static Mutex<T>, limit: std::time::Duration) -> Option<std::sync::MutexGuard<'static, T>> {
+    if limit.is_zero() {
+        return None;
     }
-    waited(3, || GUARDS.lock().unwrap_or_else(|e| e.into_inner()))
+    let began = std::time::Instant::now();
+    loop {
+        // A few tries between looks at the clock.
+        for _ in 0..32 {
+            std::hint::spin_loop();
+            match lock.try_lock() {
+                Ok(g) => return Some(g),
+                Err(std::sync::TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+        }
+        if began.elapsed() >= limit {
+            return None;
+        }
+    }
+}
+
+/// Diagnostics: how long each line of this file that takes [`GUARDS`] holds
+/// it (count, total, longest), so the holders others queue behind are known.
+#[cfg(feature = "diagnostics")]
+mod held {
+    use super::Guards;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    const SLOTS: usize = 64;
+    /// Per slot: the line (0: free), times held, nanoseconds, the longest.
+    static TABLE: [[AtomicU64; 4]; SLOTS] = [const { [const { AtomicU64::new(0) }; 4] }; SLOTS];
+
+    pub(super) struct Held {
+        g: std::sync::MutexGuard<'static, Guards>,
+        since: std::time::Instant,
+        line: u32,
+    }
+
+    impl Held {
+        pub(super) fn new(g: std::sync::MutexGuard<'static, Guards>, line: u32) -> Held {
+            Held { g, since: std::time::Instant::now(), line }
+        }
+    }
+
+    impl std::ops::Deref for Held {
+        type Target = Guards;
+        fn deref(&self) -> &Guards {
+            &self.g
+        }
+    }
+
+    impl std::ops::DerefMut for Held {
+        fn deref_mut(&mut self) -> &mut Guards {
+            &mut self.g
+        }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            // Counted while still held: the lock goes when `g` does, after this.
+            note(self.line, self.since.elapsed().as_nanos() as u64);
+        }
+    }
+
+    fn note(line: u32, ns: u64) {
+        let key = u64::from(line).max(1);
+        let start = (key as usize).wrapping_mul(0x9E37_79B9) % SLOTS;
+        for i in 0..SLOTS {
+            let slot = &TABLE[(start + i) % SLOTS];
+            let was = slot[0].load(Relaxed);
+            if was == key || (was == 0 && slot[0].compare_exchange(0, key, Relaxed, Relaxed).map_or_else(|k| k == key, |_| true)) {
+                slot[1].fetch_add(1, Relaxed);
+                slot[2].fetch_add(ns, Relaxed);
+                slot[3].fetch_max(ns, Relaxed);
+                return;
+            }
+        }
+    }
+
+    /// The holders by total time, taken (lines keep their slots), per frame.
+    pub(super) fn taken(frames: f64) -> String {
+        let mut rows: Vec<(u64, u64, u64, u64)> = TABLE
+            .iter()
+            .filter_map(|s| {
+                let line = s[0].load(Relaxed);
+                (line != 0).then(|| (line, s[1].swap(0, Relaxed), s[2].swap(0, Relaxed), s[3].swap(0, Relaxed)))
+            })
+            .filter(|r| r.1 != 0)
+            .collect();
+        rows.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+        rows.iter()
+            .take(10)
+            .map(|&(line, n, ns, most)| {
+                format!(
+                    "line {line}: {:.0}x {:.2} ms (mean {:.1} us, longest {:.2} ms)",
+                    n as f64 / frames,
+                    ns as f64 / 1e6 / frames,
+                    ns as f64 / 1e3 / n as f64,
+                    most as f64 / 1e6
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn holds_are_counted_by_line() {
+            super::note(4_000_001, 2_000);
+            super::note(4_000_001, 6_000);
+            let text = super::taken(1.0);
+            assert!(text.contains("line 4000001: 2x 0.01 ms (mean 4.0 us, longest 0.01 ms)"), "{text}");
+            // Taken: counted afresh.
+            assert!(!super::taken(1.0).contains("line 4000001"));
+        }
+    }
 }
 
 /// The 4 KiB pages of title memory that what shaders wrote was put into,
@@ -2526,7 +2680,8 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
-fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static, Guards> {
+#[cfg_attr(feature = "diagnostics", track_caller)]
+fn title_memory_changed(at: usize, len: usize) -> GuardsHeld {
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -2692,6 +2847,39 @@ mod parts_tests {
         // A page never written before: what was not named was never written.
         assert_eq!(j.note(9, 0b100, 9), 0);
         assert_eq!(j.parts_since(9, 5), 0b100);
+    }
+}
+
+#[cfg(test)]
+mod spin_tests {
+    use super::spin_for;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    #[test]
+    fn spinning_takes_a_lock_that_comes_free_and_gives_up_on_one_that_does_not() {
+        static LOCK: Mutex<u32> = Mutex::new(0);
+        // Free: taken at once. No limit: not tried at all.
+        assert!(spin_for(&LOCK, Duration::from_micros(50)).is_some());
+        assert!(spin_for(&LOCK, Duration::ZERO).is_none());
+        // Held throughout: given up after the limit.
+        let held = LOCK.lock().unwrap();
+        let began = std::time::Instant::now();
+        assert!(spin_for(&LOCK, Duration::from_micros(200)).is_none());
+        assert!(began.elapsed() >= Duration::from_micros(200));
+        // Let go while another thread spins: it takes it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spinner = std::thread::spawn(move || {
+            tx.send(()).unwrap();
+            spin_for(&LOCK, Duration::from_secs(5)).map(|mut g| {
+                *g += 1;
+                *g
+            })
+        });
+        rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        drop(held);
+        assert_eq!(spinner.join().unwrap(), Some(1));
     }
 }
 

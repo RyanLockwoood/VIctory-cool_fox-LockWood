@@ -54,7 +54,17 @@ pub(crate) extern "system" fn set_interval(
         us => Duration::from_micros(u64::from(us)),
     };
     tracing::info!(?interval, "frame interval");
-    // A new interval starts from now, after the last tick handed out.
+    TITLE_INTERVAL_US.store(interval.as_micros() as u64, Ordering::Relaxed);
+    let interval = match menu_interval() {
+        Some(fast) if MENU_FAST.load(Ordering::Relaxed) => interval.min(fast),
+        _ => interval,
+    };
+    restart(interval);
+    S_OK
+}
+
+/// A new interval starts from now, after the last tick handed out.
+fn restart(interval: Duration) {
     let first = LAST
         .iter()
         .map(|t| t.load(Ordering::Relaxed))
@@ -65,7 +75,81 @@ pub(crate) extern "system" fn set_interval(
         interval,
         first,
     });
-    S_OK
+}
+
+/// The interval the title last asked for (it asks 30 FPS in menus too).
+static TITLE_INTERVAL_US: AtomicU64 = AtomicU64::new(16_667);
+/// Whether light frames (menus, the map) run at the menu cap.
+static MENU_FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `VICTORY_MENU_FPS=144`: frames that draw little (under
+/// `VICTORY_MENU_DRAWS`, 500 by default; the world draws thousands) may run
+/// up to this rate. Off unless set; never faster than 240.
+fn menu_interval() -> Option<Duration> {
+    static FAST: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *FAST.get_or_init(|| {
+        let fps: u64 = std::env::var("VICTORY_MENU_FPS").ok()?.parse().ok()?;
+        (31..=240).contains(&fps).then(|| Duration::from_nanos(1_000_000_000 / fps))
+    })
+}
+
+fn menu_draws() -> u64 {
+    static DRAWS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *DRAWS.get_or_init(|| {
+        std::env::var("VICTORY_MENU_DRAWS").ok().and_then(|v| v.parse().ok()).unwrap_or(500)
+    })
+}
+
+/// How long frames must stay light before the menu cap starts.
+const MENU_SETTLE: Duration = Duration::from_millis(500);
+
+/// Whether the next frames should run at the menu cap: `fast` now, with the
+/// last frame's draws, and the window's frames and draws so far. A heavy
+/// frame ends it at once; it starts after a light settle window.
+fn next_menu(fast: bool, frame_draws: u64, window_frames: u64, window_draws: u64, settled: bool, limit: u64) -> bool {
+    if frame_draws >= limit {
+        return false;
+    }
+    if fast || !settled || window_frames == 0 {
+        return fast;
+    }
+    window_draws / window_frames < limit
+}
+
+/// At each frame start: picks the title's interval or the menu cap.
+fn pace_menu() {
+    let Some(fast_interval) = menu_interval() else {
+        return;
+    };
+    struct Window {
+        began: Instant,
+        drawn: u64,
+        frames: u64,
+        last: u64,
+    }
+    static WINDOW: Mutex<Option<Window>> = Mutex::new(None);
+    let drawn = crate::draw::drawn();
+    let now = Instant::now();
+    let mut window = WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+    let w = window.get_or_insert(Window { began: now, drawn, frames: 0, last: drawn });
+    let frame_draws = drawn.saturating_sub(w.last);
+    w.last = drawn;
+    w.frames += 1;
+    let settled = now - w.began >= MENU_SETTLE;
+    let limit = menu_draws();
+    let was = MENU_FAST.load(Ordering::Relaxed);
+    let window_draws = drawn.saturating_sub(w.drawn);
+    let fast = next_menu(was, frame_draws, w.frames, window_draws, settled, limit);
+    if settled || fast != was {
+        *w = Window { began: now, drawn, frames: 0, last: drawn };
+    }
+    if fast != was {
+        MENU_FAST.store(fast, Ordering::Relaxed);
+        let title = Duration::from_micros(TITLE_INTERVAL_US.load(Ordering::Relaxed));
+        let interval = if fast { title.min(fast_interval) } else { title };
+        tracing::info!(fast, frame_draws, ?interval, "menu frame cap");
+        restart(interval);
+    }
 }
 
 /// Device method: events are scheduled at every tick.
@@ -132,6 +216,9 @@ pub(crate) extern "system" fn wait(
     token: *mut u64,
 ) -> HRESULT {
     let origin = kind == ORIGIN;
+    if origin {
+        pace_menu();
+    }
     let (mut tick, mut wait) = next_tick(kind);
     let limit = Duration::from_millis(u64::from(timeout_ms));
     // A blocking wait for an event that has happened since the last wait
@@ -204,6 +291,19 @@ pub(crate) extern "system" fn statistics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn light_frames_start_the_menu_cap_and_a_heavy_one_ends_it() {
+        // Not before the settle window, however light.
+        assert!(!next_menu(false, 10, 10, 100, false, 500));
+        // After a light window.
+        assert!(next_menu(false, 10, 15, 1_500, true, 500));
+        // A heavy window (the world) keeps the title's pace.
+        assert!(!next_menu(false, 10, 15, 60_000, true, 500));
+        // Stays on while light; one heavy frame ends it at once.
+        assert!(next_menu(true, 10, 0, 0, false, 500));
+        assert!(!next_menu(true, 4_400, 1, 4_400, false, 500));
+    }
 
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
