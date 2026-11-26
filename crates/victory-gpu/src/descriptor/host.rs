@@ -13,6 +13,87 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+/// Diagnostics: of the host descriptors [`HostHeap::mirror`] makes, how many
+/// were of a view key made shortly before (into any slot), and the time the
+/// making took, the driver's calls with it. Measures whether a cache of made
+/// descriptors per view key, copied instead of made again, would pay.
+#[cfg(feature = "diagnostics")]
+pub(crate) mod make_stats {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// Recently made keys, one per slot of a hash: a key found in its slot
+    /// was made before. (Overwritten on collision: repeats are undercounted.)
+    const RECENT: usize = 1 << 16;
+
+    pub(crate) struct Stats {
+        seen: Box<[AtomicU64]>,
+        /// Made, made of a key seen before, left for later (not made), and
+        /// the nanoseconds of making (driver calls included).
+        counts: [AtomicU64; 4],
+    }
+
+    impl Stats {
+        fn new() -> Stats {
+            Stats { seen: (0..RECENT).map(|_| AtomicU64::new(0)).collect(), counts: [const { AtomicU64::new(0) }; 4] }
+        }
+
+        fn note(&self, key: u64, later: bool, ns: u64) {
+            if later {
+                self.counts[2].fetch_add(1, Relaxed);
+                return;
+            }
+            self.counts[0].fetch_add(1, Relaxed);
+            self.counts[3].fetch_add(ns, Relaxed);
+            let slot = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48) as usize % RECENT;
+            if key != 0 && self.seen[slot].swap(key, Relaxed) == key {
+                self.counts[1].fetch_add(1, Relaxed);
+            }
+        }
+
+        fn taken(&self, frames: f64) -> String {
+            let [made, again, later, ns] = [0, 1, 2, 3].map(|i| self.counts[i].swap(0, Relaxed));
+            format!(
+                "made by mirror {:.0} (of a key made before {:.0}, {:.0}%), left for later {:.0}, making {:.2} ms (all threads, driver calls included, mean {:.2} us)",
+                made as f64 / frames,
+                again as f64 / frames,
+                if made == 0 { 0.0 } else { 100.0 * again as f64 / made as f64 },
+                later as f64 / frames,
+                ns as f64 / 1e6 / frames,
+                if made == 0 { 0.0 } else { ns as f64 / 1e3 / made as f64 }
+            )
+        }
+    }
+
+    fn stats() -> &'static Stats {
+        static STATS: std::sync::OnceLock<Stats> = std::sync::OnceLock::new();
+        STATS.get_or_init(Stats::new)
+    }
+
+    pub(crate) fn note(key: u64, later: bool, ns: u64) {
+        stats().note(key, later, ns);
+    }
+
+    /// Per frame, taken: made, of them repeats, left for later, ms making.
+    pub(crate) fn taken(frames: f64) -> String {
+        stats().taken(frames)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn repeats_of_a_key_are_counted() {
+            let stats = super::Stats::new();
+            stats.note(7 << 32 | 3, false, 1_000);
+            stats.note(7 << 32 | 3, false, 3_000);
+            stats.note(8 << 32 | 3, false, 2_000);
+            stats.note(9 << 32 | 3, true, 0);
+            let text = stats.taken(1.0);
+            assert!(text.starts_with("made by mirror 3 (of a key made before 1, 33%), left for later 1, making 0.01 ms"), "{text}");
+            assert!(stats.taken(1.0).starts_with("made by mirror 0 "));
+        }
+    }
+}
+
 /// A set of a heap's slots, a bit for each: no lock (a pass that went through
 /// a set of 70,000 under its lock kept everyone who writes slots waiting for
 /// 5 ms of a frame, timeline thin-6).
@@ -3315,6 +3396,8 @@ impl HostHeap {
             }
             self.quick_is(index, 0);
             self.made.set(index, if later { 0 } else { key });
+            #[cfg(feature = "diagnostics")]
+            let making = std::time::Instant::now();
             let kept = if later {
                 None
             } else {
@@ -3323,6 +3406,8 @@ impl HostHeap {
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.at(index));
             }
+            #[cfg(feature = "diagnostics")]
+            make_stats::note(key, later, making.elapsed().as_nanos() as u64);
             if kept.is_some() || !self.sampler {
                 self.put(index);
             }

@@ -561,6 +561,8 @@ pub(crate) fn sync_line(frames: f64) {
         split[3] / 1e6 / frames,
         split[4] / 1e6 / frames
     );
+    #[cfg(feature = "diagnostics")]
+    tracing::info!("descriptors per frame, all of mirror's callers: {}", host::make_stats::taken(frames));
 }
 
 /// Title descriptor slots in a changed byte range that have host counterparts.
