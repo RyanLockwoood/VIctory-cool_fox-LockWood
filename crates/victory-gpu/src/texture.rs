@@ -472,6 +472,33 @@ fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> 
 /// bytes.
 static STAGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Cumulative regular-list upload bytes, first uploads after eviction, and their bytes.
+pub(crate) static UPLOAD_TRAFFIC: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+#[derive(Clone, Copy)]
+pub(crate) enum UploadPath {
+    Prefetch,
+    Draw,
+    Bake,
+    Ahead,
+}
+
+pub(crate) static UPLOAD_PATH_BYTES: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn note_recorded_upload(copy: &crate::resource::HostTexture, bytes: u64, path: UploadPath) {
+    use std::sync::atomic::Ordering::Relaxed;
+    UPLOAD_PATH_BYTES[path as usize].fetch_add(bytes, Relaxed);
+    if !matches!(path, UploadPath::Ahead) {
+        UPLOAD_TRAFFIC[0].fetch_add(bytes, Relaxed);
+    }
+    if copy.first_upload_after_eviction.swap(false, Relaxed) {
+        UPLOAD_TRAFFIC[1].fetch_add(1, Relaxed);
+        UPLOAD_TRAFFIC[2].fetch_add(bytes, Relaxed);
+    }
+}
+
 pub(crate) fn live_staging_bytes() -> u64 {
     STAGED[1].load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -661,6 +688,8 @@ pub(crate) fn upload(list: &HostList, resource: This, _texture: &ID3D12Resource)
 thread_local! {
     /// The thread records uploads for a draw that bakes from them.
     pub(crate) static BAKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Required bake uploads, including when exact staging is disabled.
+    pub(crate) static BAKE_UPLOAD_CONTEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The thread records the upload of a texture picked by index, of which
     /// that many bytes were found mapped just now (`u64::MAX`: not asked).
     pub(crate) static PICKING: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
@@ -755,7 +784,6 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     let Some(copy) = crate::resource::host_copy(resource) else {
         return;
     };
-    let texture = &copy.texture;
     ahead::listed(&copy);
     let Some(staging) = staging(resource, &copy, first) else {
         return;
@@ -812,7 +840,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
             once!("no upload buffer for a CPU-written movie plane");
             return;
         };
-        record_upload(list, resource, texture, &staging, &source, 0);
+        record_upload(list, resource, &copy, &staging, &source, 0);
         staging.uploaded.store(true, Relaxed);
         return;
     }
@@ -837,7 +865,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         };
         staging.expected.store(there, Relaxed);
     }
-    record_upload(list, resource, texture, &staging, &staging.buffer, staging.base);
+    record_upload(list, resource, &copy, &staging, &staging.buffer, staging.base);
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
     // again if it detiles (the next list then uploads once more).
@@ -884,13 +912,14 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
 fn record_upload(
     list: &HostList,
     resource: This,
-    texture: &ID3D12Resource,
+    copy: &crate::resource::HostTexture,
     staging: &Staging,
     source: &ID3D12Resource,
     base: u64,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
     const COPY_DEST: u32 = 0x400;
+    let texture = &copy.texture;
     // A texture cut from a block may lie where another did: what the card
     // holds of that one is done with before the first upload into this one.
     if crate::pool::on() && !staging.uploaded.load(Relaxed) {
@@ -959,6 +988,16 @@ fn record_upload(
         };
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    }
+    if crate::residency::sampling_enabled() {
+        let path = if BAKE_UPLOAD_CONTEXT.get() || BAKING.get() {
+            UploadPath::Bake
+        } else if PICKING.get().is_some() {
+            UploadPath::Prefetch
+        } else {
+            UploadPath::Draw
+        };
+        note_recorded_upload(copy, staging.bytes, path);
     }
 }
 

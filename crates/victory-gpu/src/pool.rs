@@ -363,9 +363,25 @@ pub(crate) fn texture_room() -> u64 {
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
-#[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 2] {
     [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
+}
+
+/// Texture heap capacity split into occupied, reusable, and resting ranges.
+pub(crate) fn texture_memory() -> (u64, u64, u64, u64) {
+    let pool = lock(&TEXTURES);
+    let mut capacity = 0;
+    let mut free = 0;
+    let mut empty = 0;
+    for block in pool.blocks.iter().flatten() {
+        capacity += BLOCK;
+        free += block.free.0.values().sum::<u64>();
+        if block.free.whole(BLOCK) {
+            empty += BLOCK;
+        }
+    }
+    let resting = pool.resting.iter().map(|(_, piece)| piece.len).sum::<u64>();
+    (capacity - free - resting, free, empty, resting)
 }
 
 /// Part of a block of mapped upload memory, back in the pool when dropped.
