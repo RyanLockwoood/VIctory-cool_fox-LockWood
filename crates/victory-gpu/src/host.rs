@@ -75,10 +75,17 @@ unsafe impl Sync for Host {}
 /// releases reach the host at once, from its own threads, while the host
 /// runs a submission: freeing there is a GPU page fault on the freed
 /// texture (a device hang).
-static RETIRED: Mutex<std::collections::VecDeque<(u64, Retired)>> = Mutex::new(std::collections::VecDeque::new());
+static RETIRED: Mutex<std::collections::VecDeque<Retirement>> = Mutex::new(std::collections::VecDeque::new());
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct Retirement {
+    submission: u64,
+    queued_ms: u64,
+    // Dropped after the queue lock is released.
+    _object: Retired,
+}
 
 /// A retired object, dropped on whatever thread finishes the submission.
 #[allow(dead_code)]
@@ -444,11 +451,28 @@ fn sweep() {
     if crate::residency::pressured() {
         trim_spare_chunks();
     }
-    crate::pool::room(host().and_then(|h| h.video_memory()));
+    let video_memory = host().and_then(|h| h.video_memory());
+    if crate::residency::sampling_enabled() {
+        crate::residency::log_sample(video_memory);
+    }
+    crate::pool::room(video_memory);
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+}
+
+/// Queue depth and time since the oldest remaining retirement was enqueued.
+pub(crate) fn retirement_sample() -> (usize, Option<u64>) {
+    let retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    let oldest_ms = retired.front().map(|entry| coarse_ms().saturating_sub(entry.queued_ms));
+    (retired.len(), oldest_ms)
+}
+
+fn enqueue_retirement(submission: u64, object: Retired) {
+    let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    let queued_ms = if crate::residency::sampling_enabled() { coarse_ms() } else { 0 };
+    retired.push_back(Retirement { submission, queued_ms, _object: object });
 }
 
 /// The number of the newest submission begun, and of the newest of which all
@@ -469,10 +493,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push_back((started, Retired::Any(Box::new(object))));
+    enqueue_retirement(started, Retired::Any(Box::new(object)));
 }
 
 /// [`retire`] for a resource.
@@ -485,7 +506,7 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
+    enqueue_retirement(started, Retired::Resource(object));
 }
 
 /// How many submissions later than it could (the last one that may use it
@@ -507,9 +528,9 @@ fn bury_lag() -> u64 {
 /// those is dropped a little later than it could be.
 fn bury(finished: u64) {
     let finished = finished.saturating_sub(bury_lag());
-    let done: Vec<(u64, Retired)> = {
+    let done: Vec<Retirement> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
-        let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
+        let n = retired.iter().take_while(|entry| entry.submission <= finished).count();
         if n == 0 {
             return;
         }
@@ -627,6 +648,17 @@ pub(crate) fn log_removal_context() {
 /// detiling), then waiting for the GPU.
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+/// Cumulative submission preparation, submitter waits, and relay fence waits.
+pub(crate) static STALL_TIMING_US: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+fn note_submission_timing(category: usize, elapsed_us: u64) {
+    SUBMISSION_US[category].fetch_add(elapsed_us, Ordering::Relaxed);
+    if crate::residency::sampling_enabled() {
+        STALL_TIMING_US[category].fetch_add(elapsed_us, Ordering::Relaxed);
+    }
+}
 
 /// After submissions: shader-written ranges compared and copied back into
 /// title memory (microseconds, bytes that differed), since the last
@@ -3375,7 +3407,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     let us = waiting.elapsed().as_micros() as u64;
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
-    SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
+    note_submission_timing(1, us);
     #[cfg(feature = "diagnostics")]
     blamed(why, us);
 }
@@ -3468,7 +3500,11 @@ fn relay_worker() {
                 if waited.is_err() {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
-                RELAY_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+                let us = waiting.elapsed().as_micros() as u64;
+                RELAY_STATS[2].fetch_add(us, Ordering::Relaxed);
+                if crate::residency::sampling_enabled() {
+                    STALL_TIMING_US[2].fetch_add(us, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -5339,7 +5375,7 @@ impl Host {
                 let gpu = waiting.elapsed();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
-                SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+                note_submission_timing(1, gpu.as_micros() as u64);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::card_waited(gpu.as_micros() as u64, || {
                     format!("{flights} submissions sent ahead, settled together")
@@ -5735,7 +5771,7 @@ impl Host {
                 texture_back_ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
             }
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
-            SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
+            note_submission_timing(0, (prepared - started).saturating_sub(settled).as_micros() as u64);
             submitting(0, 0);
             #[cfg(feature = "diagnostics")]
             crate::copystat::submission_ends(lock);
@@ -5819,8 +5855,8 @@ impl Host {
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
         let gpu = prepared.elapsed();
-        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
-        SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        note_submission_timing(0, (prepared - started).as_micros() as u64);
+        note_submission_timing(1, gpu.as_micros() as u64);
         #[cfg(feature = "diagnostics")]
         crate::copystat::card_waited(gpu.as_micros() as u64, || {
             let pipelines: std::collections::BTreeSet<String> = runs

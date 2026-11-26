@@ -1175,6 +1175,7 @@ pub(crate) struct HostTexture {
     /// Made in place of one with fewer levels: the slots that show that one
     /// are made again once this one was filled whole.
     pub(crate) grown: std::sync::atomic::AtomicBool,
+    pub(crate) first_upload_after_eviction: std::sync::atomic::AtomicBool,
     /// What the last submitted upload put in it.
     pub(crate) holds: std::sync::Arc<Holds>,
     /// Who makes its first upload (`crate::texture::ahead`).
@@ -1219,6 +1220,7 @@ struct Hosted {
     refused: std::sync::atomic::AtomicBool,
     /// Its host copy was let go as idle once.
     gone: std::sync::atomic::AtomicBool,
+    evicted: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
     placed: std::sync::atomic::AtomicBool,
     /// The lowest level a view asked for since it had no host copy
@@ -1531,6 +1533,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if !make || r.host.refused.load(Relaxed) {
             return None;
         }
+        let _timer = crate::draw::TextureHeapTimer::phase(&crate::draw::TEXTURE_HEAP_CREATE_US);
         let clear = r
             .host
             .clear
@@ -1626,6 +1629,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[4].fetch_add(1, Relaxed);
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
+        *host.first_upload_after_eviction.get_mut() = r.host.evicted.swap(false, Relaxed);
         KINDS[6].fetch_add(1, Relaxed);
         *made = Some((std::sync::Arc::new(host), twin));
         // Slots the title wrote with views of it while it had no host copy
@@ -2044,6 +2048,11 @@ pub(crate) fn let_go_idle() {
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
+    // The VRAM policy already trims more aggressively when it sets a byte
+    // limit. Apply the host commit limit only to the long-retention path.
+    let low_commit = crate::residency::trim_textures_for_commit();
+    let commit_trim = low_commit && most == u64::MAX && idle_ms >= 60_000;
+    let (idle_ms, release_limit) = if commit_trim { (30_000, 128 << 20) } else { (idle_ms, most) };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -2068,7 +2077,9 @@ pub(crate) fn let_go_idle() {
     static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     static WHOLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let whole = *WHOLE.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_some_and(|v| v == "whole"));
-    let part = if most != u64::MAX {
+    let part = if commit_trim {
+        PART
+    } else if most != u64::MAX {
         0
     } else if whole || idle_ms < 60_000 {
         usize::MAX
@@ -2077,9 +2088,12 @@ pub(crate) fn let_go_idle() {
     };
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
+    let sample = crate::residency::sampling_enabled()
+        && tracing::enabled!(target: "victory_memory", tracing::Level::INFO);
+    let mut referenced_bytes = 0;
     let began = std::time::Instant::now();
     for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
-        if bytes >= most {
+        if bytes >= release_limit {
             break;
         }
         looked += 1;
@@ -2101,13 +2115,19 @@ pub(crate) fn let_go_idle() {
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
-            if idle {
+            if idle && (!commit_trim || made.as_ref().is_some_and(|(host, _)| host.bytes <= release_limit - bytes)) {
                 // Under the lock: the next use must not find the staging
                 // state of the texture let go (it says "uploaded").
                 crate::texture::unstage(at as This);
                 r.host.wanted.store(u32::MAX, Relaxed);
+                if sample {
+                    r.host.evicted.store(true, Relaxed);
+                }
                 made.take()
             } else {
+                if sample && !idle && let Some((host, _)) = made.as_ref() {
+                    referenced_bytes += host.bytes;
+                }
                 None
             }
         };
@@ -2126,6 +2146,21 @@ pub(crate) fn let_go_idle() {
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     SWEPT_US[2].fetch_max(began.elapsed().as_micros() as u64, Relaxed);
+    if sample {
+        tracing::info!(
+            target: "victory_memory",
+            frame = crate::frame::current(),
+            idle_ms,
+            commit_trim,
+            eviction_limit_mib = (release_limit != u64::MAX).then_some(release_limit >> 20),
+            scanned = looked,
+            age_candidates = by_age.len(),
+            protected_mib = referenced_bytes >> 20,
+            evicted_mib = bytes >> 20,
+            evicted = went,
+            "texture eviction sample"
+        );
+    }
     if went > 0 {
         crate::host::trail(|| {
             format!(
@@ -2296,6 +2331,7 @@ impl HostTexture {
             base: 0,
             serial: SERIAL.fetch_add(1, Relaxed) + 1,
             grown: Default::default(),
+            first_upload_after_eviction: Default::default(),
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
             flags,
@@ -2321,6 +2357,7 @@ impl HostTexture {
             base: 0,
             serial: SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
             grown: Default::default(),
+            first_upload_after_eviction: Default::default(),
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
             flags,
@@ -2689,6 +2726,7 @@ fn hand_out_resource(
             used: std::sync::atomic::AtomicU64::new(0),
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
+            evicted: Default::default(),
             placed: std::sync::atomic::AtomicBool::new(false),
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
             grown: std::sync::atomic::AtomicBool::new(false),

@@ -1,4 +1,4 @@
-﻿//! Host-memory admission for speculative texture work and reusable upload storage.
+//! Host-memory admission for speculative texture work and reusable upload storage.
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -97,9 +97,9 @@ pub(crate) fn limited_host_ram() -> bool {
 
 fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
     if was {
-        physical < 5 * GIB || commit < 6 * GIB
+        physical < 8 * GIB || commit < 8 * GIB
     } else {
-        physical <= 3 * GIB || commit <= 4 * GIB
+        physical <= 6 * GIB || commit <= 6 * GIB
     }
 }
 
@@ -139,11 +139,105 @@ pub(crate) fn pressured() -> bool {
     PRESSURED.load(Ordering::Relaxed)
 }
 
+pub(crate) fn sampling_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("VICTORY_MEMORY_SAMPLE").as_deref() == Ok("1"))
+}
+
+/// Records a snapshot before the periodic texture and staging pool eviction.
+pub(crate) fn log_sample(video: Option<[u64; 4]>) {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    if !tracing::enabled!(target: "victory_memory", tracing::Level::INFO) {
+        return;
+    }
+    let mut process = PROCESS_MEMORY_COUNTERS_EX {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the process handle is valid and cb describes the extended output buffer.
+    let process_ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut process).cast(), process.cb) } != 0;
+    let (arena, idle_arena) = crate::upload::arena_bytes();
+    let [texture_pool, staging_pool] = crate::pool::memory();
+    let (texture_occupied, texture_free, texture_empty, texture_resting) = crate::pool::texture_memory();
+    let (retired, oldest_ms) = crate::host::retirement_sample();
+    let (started, finished) = crate::host::submissions();
+    let queued = crate::queue::queued();
+    let os = memory_status();
+    tracing::info!(
+        target: "victory_memory",
+        frame = crate::frame::current(),
+        elapsed_ms = crate::host::now_ms(),
+        process_private_mib = process_ok.then_some(process.PrivateUsage as u64 / MIB),
+        process_working_set_mib = process_ok.then_some(process.WorkingSetSize as u64 / MIB),
+        physical_free_mib = os.as_ref().map(|s| s.ullAvailPhys / MIB),
+        available_commit_mib = os.as_ref().map(|s| s.ullAvailPageFile / MIB),
+        dxgi_local_budget_mib = video.map(|v| v[0] / MIB),
+        dxgi_local_used_mib = video.map(|v| v[1] / MIB),
+        dxgi_nonlocal_budget_mib = video.map(|v| v[2] / MIB),
+        dxgi_nonlocal_used_mib = video.map(|v| v[3] / MIB),
+        upload_arena_mib = arena / MIB,
+        upload_arena_idle_mib = idle_arena / MIB,
+        texture_pool_mib = texture_pool,
+        texture_pool_occupied_mib = texture_occupied / MIB,
+        texture_pool_free_mib = texture_free / MIB,
+        texture_pool_empty_heaps_mib = texture_empty / MIB,
+        texture_pool_resting_mib = texture_resting / MIB,
+        staging_pool_mib = staging_pool,
+        live_staging_mib = crate::texture::live_staging_bytes() / MIB,
+        texture_recorded_upload_bytes = crate::texture::UPLOAD_TRAFFIC[0].load(Ordering::Relaxed),
+        texture_prefetch_upload_bytes = crate::texture::UPLOAD_PATH_BYTES[crate::texture::UploadPath::Prefetch as usize].load(Ordering::Relaxed),
+        texture_draw_upload_bytes = crate::texture::UPLOAD_PATH_BYTES[crate::texture::UploadPath::Draw as usize].load(Ordering::Relaxed),
+        texture_bake_upload_bytes = crate::texture::UPLOAD_PATH_BYTES[crate::texture::UploadPath::Bake as usize].load(Ordering::Relaxed),
+        texture_ahead_upload_bytes = crate::texture::UPLOAD_PATH_BYTES[crate::texture::UploadPath::Ahead as usize].load(Ordering::Relaxed),
+        prefetch_pressure_time_stops = crate::draw::PREFETCH_PRESSURE_TIME_STOPS.load(Ordering::Relaxed),
+        texture_heap_pass_us = crate::draw::TEXTURE_HEAP_PASS_US.load(Ordering::Relaxed),
+        texture_heap_descriptors_us = crate::draw::TEXTURE_HEAP_DESCRIPTORS_US.load(Ordering::Relaxed),
+        texture_heap_create_us = crate::draw::TEXTURE_HEAP_CREATE_US.load(Ordering::Relaxed),
+        texture_heap_staging_us = crate::draw::TEXTURE_HEAP_STAGING_US.load(Ordering::Relaxed),
+        texture_staging_lock_wait_us = crate::texture::STAGING_LOCK_WAIT_US.load(Ordering::Relaxed),
+        texture_staging_footprint_us = crate::texture::STAGING_FOOTPRINT_US.load(Ordering::Relaxed),
+        texture_staging_buffer_us = crate::texture::STAGING_BUFFER_US.load(Ordering::Relaxed),
+        submission_prepare_us = crate::host::STALL_TIMING_US[0].load(Ordering::Relaxed),
+        submitter_wait_us = crate::host::STALL_TIMING_US[1].load(Ordering::Relaxed),
+        relay_fence_wait_us = crate::host::STALL_TIMING_US[2].load(Ordering::Relaxed),
+        texture_first_uploads_after_eviction = crate::texture::UPLOAD_TRAFFIC[1].load(Ordering::Relaxed),
+        texture_first_upload_bytes_after_eviction = crate::texture::UPLOAD_TRAFFIC[2].load(Ordering::Relaxed),
+        buffer_mirror_span_mib = crate::shadow::live_span_bytes() / MIB,
+        spare_scratch_mib = crate::host::ALIVE[4].load(Ordering::Relaxed) / MIB,
+        retired,
+        oldest_retired_ms = oldest_ms,
+        queued,
+        started,
+        finished,
+        "memory sample"
+    );
+}
+
 /// True when OS commit headroom is critically low (< 1.5 GiB) or an allocation
 /// just failed with `E_OUTOFMEMORY`, requiring emergency throttling.
 pub(crate) fn critical_commit() -> bool {
     let now = crate::host::coarse_ms();
     now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) || sample_commit(now) < 1536 * MIB
+}
+
+/// Enables extra texture eviction after three seconds below the commit reserve.
+pub(crate) fn trim_textures_for_commit() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static LOW_SINCE: AtomicU64 = AtomicU64::new(0);
+    if !*ENABLED.get_or_init(|| std::env::var("VICTORY_TEXTURE_COMMIT_TRIM").as_deref() == Ok("1")) {
+        return false;
+    }
+    let now = crate::host::coarse_ms().saturating_add(1);
+    if sample_commit(now - 1) >= 1536 * MIB {
+        LOW_SINCE.store(0, Ordering::Relaxed);
+        return false;
+    }
+    match LOW_SINCE.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed) {
+        Ok(_) => false,
+        Err(since) => now.saturating_sub(since) >= 3000,
+    }
 }
 
 /// A soft per-frame admission limit. A single texture can cross it. The
@@ -183,8 +277,8 @@ mod tests {
         assert!(next_pressure(false, 3 * GIB, 16 * GIB));
         assert!(next_pressure(true, 4 * GIB, 7 * GIB));
         assert!(next_pressure(true, 6 * GIB, 5 * GIB));
-        assert!(!next_pressure(true, 5 * GIB, 6 * GIB));
-        assert!(!next_pressure(false, 4 * GIB, 5 * GIB));
+        assert!(!next_pressure(true, 8 * GIB, 8 * GIB));
+        assert!(!next_pressure(false, 7 * GIB, 7 * GIB));
     }
 
     #[test]

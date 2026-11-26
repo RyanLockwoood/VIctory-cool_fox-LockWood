@@ -746,6 +746,45 @@ mod heap_range_tests {
 /// still waiting.
 pub(crate) static HEAP_TEXTURES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURE_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PREFETCH_PRESSURE_TIME_STOPS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TEXTURE_HEAP_PASS_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TEXTURE_HEAP_DESCRIPTORS_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TEXTURE_HEAP_CREATE_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TEXTURE_HEAP_STAGING_US: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static TEXTURE_HEAP_TIMING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) struct TextureHeapTimer {
+    started: std::time::Instant,
+    counter: &'static AtomicU64,
+    previous_pass: Option<bool>,
+}
+
+impl TextureHeapTimer {
+    fn pass() -> Option<Self> {
+        crate::residency::sampling_enabled().then(|| Self {
+            started: std::time::Instant::now(),
+            counter: &TEXTURE_HEAP_PASS_US,
+            previous_pass: Some(TEXTURE_HEAP_TIMING.replace(true)),
+        })
+    }
+
+    pub(crate) fn phase(counter: &'static AtomicU64) -> Option<Self> {
+        TEXTURE_HEAP_TIMING.get().then(|| Self { started: std::time::Instant::now(), counter, previous_pass: None })
+    }
+}
+
+impl Drop for TextureHeapTimer {
+    fn drop(&mut self) {
+        self.counter.fetch_add(self.started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if let Some(previous) = self.previous_pass {
+            TEXTURE_HEAP_TIMING.set(previous);
+        }
+    }
+}
+
 pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// Passes that made no texture because the card had no room
 /// (`crate::resource::room`), for the memory line.
@@ -2216,7 +2255,9 @@ impl State {
                         {
                             let was_staged = crate::texture::is_staged(resource);
                             let _ = crate::residency::take_staging_deferred();
+                            let previous_bake = crate::texture::BAKE_UPLOAD_CONTEXT.replace(true);
                             readable(list, sampled.kind, &view);
+                            crate::texture::BAKE_UPLOAD_CONTEXT.set(previous_bake);
                             let failed = crate::residency::take_staging_deferred() || crate::residency::upload_refused();
                             if !was_staged {
                                 crate::texture::unstage(resource);
@@ -2514,6 +2555,7 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return true;
         }
+        let _timer = TextureHeapTimer::pass();
         let memory = crate::host::host().and_then(|h| h.video_memory());
         // `VICTORY_TEXTURE_STAGE_MB` sets it: a backlog of tens of thousands of
         // textures (a scene's first minutes) then drains in fewer frames.
@@ -2556,6 +2598,7 @@ impl State {
             once!("textures picked by index: the card has no room for more; they wait");
         }
         let mut refused = 0;
+        let descriptor_timer = TextureHeapTimer::phase(&TEXTURE_HEAP_DESCRIPTORS_US);
         // Room again: the slots held back while the card was full are due
         // now (`full_card_pass`).
         if room {
@@ -2591,6 +2634,7 @@ impl State {
             let (ahead, _) = host.texture_slots_due(frame + BAKE_AHEAD[usize::from(again)], 1 << 16);
             due.extend(ahead.into_iter().filter(|(index, _)| !known.contains(index)));
         }
+        drop(descriptor_timer);
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -2645,25 +2689,44 @@ impl State {
         };
         // Apply the shared frame ceiling after early-pass and catch-up budgets.
         // A bake samples its inputs immediately and cannot retry that draw.
+        let auto_prefetch = !required && asked.is_none();
+        let critical = auto_prefetch && crate::residency::critical_commit();
+        let pressured = auto_prefetch && crate::residency::pressured();
         let bytes_at_most = if required || asked.is_some() {
             bytes_at_most
         } else {
             crate::residency::prefetch_limit(
                 bytes_at_most,
-                crate::residency::pressured(),
-                crate::residency::critical_commit(),
+                pressured,
+                critical,
                 crate::residency::limited_host_ram(),
                 crate::texture::live_staging_bytes(),
             )
         };
 
+        static PRESSURE_TIME_LIMIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let pressure_span = if (pressured || critical)
+            && !crate::texture::BAKING.get()
+            && *PRESSURE_TIME_LIMIT.get_or_init(|| std::env::var("VICTORY_PREFETCH_PRESSURE_TIME").as_deref() == Ok("1"))
+        {
+            span.min(std::time::Duration::from_millis(if critical { 4 } else { 8 }))
+        } else {
+            span
+        };
         let began = std::time::Instant::now();
         if sync.is_none() {
             BAKE_SERVED.store(0, Ordering::Relaxed);
         }
         let mut served = true;
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+            if SPENT.load(Ordering::Relaxed) >= bytes_at_most {
+                served = false;
+                break;
+            }
+            if began.elapsed() > pressure_span {
+                if pressure_span < span {
+                    PREFETCH_PRESSURE_TIME_STOPS.fetch_add(1, Ordering::Relaxed);
+                }
                 served = false;
                 break;
             }
@@ -2940,7 +3003,9 @@ impl State {
                 // (What was found mapped of it a moment ago is not asked
                 // again, unless the host copy may need more.)
                 crate::texture::PICKING.set(Some(there.filter(|_| partly.is_none()).unwrap_or(u64::MAX)));
+                let previous_bake = crate::texture::BAKE_UPLOAD_CONTEXT.replace(required);
                 readable(list, sampled.kind, view);
+                crate::texture::BAKE_UPLOAD_CONTEXT.set(previous_bake);
                 crate::texture::PICKING.set(None);
             }
             // A failed or deferred staging allocation leaves this slot due.

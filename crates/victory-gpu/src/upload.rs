@@ -28,6 +28,21 @@ struct Arena {
 
 static ARENAS: Mutex<Vec<Arena>> = Mutex::new(Vec::new());
 
+/// Committed arena bytes and the subset in completely idle arenas.
+pub(crate) fn arena_bytes() -> (u64, u64) {
+    let arenas = ARENAS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut committed = 0;
+    let mut idle = 0;
+    for arena in arenas.iter() {
+        let bytes = (arena.taken.len() * BLOCK) as u64;
+        committed += bytes;
+        if !arena.taken.contains(&true) {
+            idle += bytes;
+        }
+    }
+    (committed, idle)
+}
+
 /// Upload memory of one request, zeroed, given back when dropped.
 pub(crate) struct Upload(Kind);
 

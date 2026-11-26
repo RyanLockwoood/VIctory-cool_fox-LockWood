@@ -305,6 +305,9 @@ impl Job {
             // SAFETY: the caller's.
             unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
         }
+        if crate::residency::sampling_enabled() {
+            super::note_recorded_upload(&self.copy, s.bytes, super::UploadPath::Ahead);
+        }
     }
 }
 
