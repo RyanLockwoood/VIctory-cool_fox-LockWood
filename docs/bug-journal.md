@@ -2,6 +2,17 @@
 
 ## 2026-11-27
 
+- **Audit of the VIctory-7900XTX merge (`e05d463`, read-only): nothing vendor-specific to replace.**
+  - It is one commit: 13 files, +974/−129.
+  - No added line names AMD, Radeon, RDNA, 7900, NVIDIA or a vendor id (0x1002 / 0x10DE).
+  - New switches: `VICTORY_BURY_LAG`, `VICTORY_DSTORAGE_STAGING_MB`, `VICTORY_KEYS` (our benchmark's key script).
+  - Content: two-plane compose (the Series S black-screen fix), fallback heaps, TablePlan, residency guard, 256 MiB DirectStorage staging, WaitOnAddress fence wakes. All run on the RTX 5090 and are kept.
+  - NVIDIA-specific gains come instead from `trustno1-coder/VIctory-NVIDIA`, in order:
+    - the ownerless-view cap `89fd9361` (the second half of the leak fix);
+    - the port-1 fix `376f9832`;
+    - the submitting-thread merge `f1edd663`;
+    - DLSS once the card is the limit.
+
 - **`VICTORY_PLACED_FIELDS=1` (padding words left out, commit `8123d60`, off unless set): shapes grow 30% slower, but still grow.**
   - Pass `VIctory-bench/runs/padding-*`, diagnostics build `target/counters`. Compared with `counters2` (same build without the fix), "shapes of placed views kept" at the same cutscene seconds:
 
