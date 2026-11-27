@@ -2,6 +2,19 @@
 
 ## 2026-11-27
 
+- **Window switches A/B: worse, so they stay off.**
+  - Batch `VIctory-bench/runs/win-ab-20261127-193852`, release `ports-only`, `LEVELS_ON_DEMAND=0`, 4 passes. A = defaults, B = `VICTORY_WINDOW_KB=1024` + `VICTORY_WINDOW_TAILS=1`, with `-MemoryMap`.
+  - The script's "PresentMon not recording" warning was false: the UAC prompt was still open after its 5 s check. The check now waits up to 30 s.
+  - **PresentMon means A → B:**
+    - avg 23.4 → 21.5 frames/s
+    - p95 72.0 → 86.4 ms
+    - p99 143.1 → 199.4 ms
+    - frames over 100 ms 206 → 310
+    - A's two passes differ (24.9 / 21.9 frames/s), so the batch is noisier than earlier ones, but both B passes are worse.
+  - **Memory, means A → B:** private 32.6 → 34.8 GB, commit left 5.0 → 2.4 GB, VRAM 16.5 → 18.8 GB. Working set at the maps: A 21.3 / 18.5 GB, B 18.0 / 19.9 GB.
+  - **No RAM gain, more stutter.** As `shadow.rs` warned, finer windows put the same memory into several windows.
+  - Next RAM step: `VICTORY_CARD_AWAKE=0` (settings only), then the host-list pooling from the NOTES plan (code).
+
 - **Leak test: no steady leak** (`VIctory-bench/runs/leaktest-*`, release `ports-only`, `LEVELS_ON_DEMAND=0`; cutscene, then 15 min standing still from 08:09:26).
   - Private memory during the hold (t = 549 → 735 → 862 → 1001 → 1146 → 1444 s): 36.0 → 35.8 → 36.8 → 37.7 → 37.7 → 37.8 GB. One step of +1.9 GB around 860–1000 s, then flat: +0.06 GB over the last ~7 min.
   - Working set ~19–20 GB flat; texture pool 14.85 GB flat; commit left 4.2 → 2.3 GB.
