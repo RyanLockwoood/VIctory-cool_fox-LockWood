@@ -2,6 +2,14 @@
 
 ## 2026-11-27
 
+- **Host command lists, read-only (for the NOTES plan's milestone B).**
+  - Each `HostList` (`host.rs` `make_list`) owns its own allocator and list. Its prelude (a second allocator and list) is made lazily: `VICTORY_LAZY_PRELUDE`, on by default.
+  - **List pooling exists already** (`list.rs`: `VICTORY_LIST_POOL`, on by default). `recycle` resets lists whose submission ran and keeps them for `fresh_list`, up to `IDLE_MOST` = 512 lists / 256 MB. With `VICTORY_THIN=1` the title's lists get no host list at creation.
+  - What remains of milestone B is allocator sharing per worker and frame, since each pooled list keeps its allocator at its high-water mark.
+  - Unknown on this PC: how the 1,560 live lists split (idle pool / in flight / held) and what one costs in RAM. The digest's 1.1–1.3 MB per list is from an AMD card.
+  - **Next (proposed, diagnostics only):** counters for that split, and a switch `VICTORY_LIST_IDLE_MOST` (default 512) for an A/B such as 512 against 64, before any allocator-sharing work.
+- **`UNIFIED-MEMORY-SOLUTIONS(1).md` (NOTES) read.** It is written for the other (AMD) fork, and none of its seven switches exist in our build. It confirms that the cost is detection, not transfer (~1 ms of bus a frame). Its texture section asks for the same first measure as our counters: stop re-hashing unchanged memory. It also suggests reusing host textures by shape, and letting copies go when their title memory is unmapped. Saved to `Desktop/CLAUDE/references/`.
+
 - **`VICTORY_CARD_AWAKE=0` wins: GPU load 96 → 41%, stutter time −45%, +10% fps.**
   - Batch `VIctory-bench/runs/awake-ab-20261127-202148`, release `ports-only`, `LEVELS_ON_DEMAND=0`, 4 passes: A = 1 (the launchers' default), B = 0. GPU logged by `nvidia-smi` every second (`gpu.csv`).
   - **PresentMon means A → B:**
