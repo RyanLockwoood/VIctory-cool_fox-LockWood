@@ -816,6 +816,13 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         staging.once.store(false, Relaxed);
     }
     staging.used.store(crate::host::moment(), Relaxed);
+    // Why this upload is recorded, for `crate::texstat`.
+    #[cfg(feature = "diagnostics")]
+    let mut why = if staging.uploaded.load(Relaxed) && staging.dirty.load(Relaxed) {
+        crate::texstat::Why::Changed
+    } else {
+        crate::texstat::Why::NewStaging
+    };
     // Levels on demand: a view of the texture now starts at another
     // level, or another texture now starts inside its span, with no byte
     // of its memory changed. The levels are judged anew: detiled again at
@@ -823,6 +830,10 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     if staging.on_demand && staging.judgement() != staging.judged() {
         staging.forget();
         staging.dirty.store(true, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        {
+            why = crate::texstat::Why::Levels;
+        }
     }
     // Levels on demand: the last upload left a held level without tiles
     // (the card had no room, or no heap could be had), and nothing else
@@ -837,6 +848,10 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
                 staging.waiting.store(0, Relaxed);
                 staging.dirty.store(true, Relaxed);
                 crate::tiles::STATS[10].fetch_add(1, Relaxed);
+                #[cfg(feature = "diagnostics")]
+                {
+                    why = crate::texstat::Why::Retry;
+                }
             } else {
                 staging.waiting.store(crate::host::moment().max(1), Relaxed);
             }
@@ -874,7 +889,13 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         return;
     }
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::TexUploads, 1);
+    {
+        crate::copystat::add(crate::copystat::C::TexUploads, 1);
+        if baking {
+            why = crate::texstat::Why::Bake;
+        }
+        crate::texstat::upload(staging.memory as u64, staging.bytes, why);
+    }
     if no_wait() && fill_unlocked() {
         let there = match picking {
             Some(there) if there != u64::MAX => there,
@@ -1330,6 +1351,16 @@ impl Staging {
             if !exact && last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
+            #[cfg(feature = "diagnostics")]
+            {
+                // The 64 KiB pages written since the last asking, against
+                // the whole texture that is read and detiled again.
+                let pages = written.iter().filter(|&&(_, w)| last.asked == 0 || w > last.asked).count();
+                let written_bytes = (pages * crate::watch::PAGE).min(size) as u64;
+                crate::texstat::add(crate::texstat::T::WatchedN, 1);
+                crate::texstat::add(crate::texstat::T::WatchedRead, size as u64);
+                crate::texstat::add(crate::texstat::T::WatchedWritten, written_bytes);
+            }
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
@@ -1354,6 +1385,8 @@ impl Staging {
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // The guard saw no write: a change the hash finds came another way.
         let mut blind = false;
+        #[cfg(feature = "diagnostics")]
+        let mut guarded = false;
         if !alone
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
@@ -1375,7 +1408,26 @@ impl Staging {
                 return 0;
             }
             blind = unwritten;
+            #[cfg(feature = "diagnostics")]
+            {
+                guarded = true;
+            }
         }
+        // Which path a hashed refresh took, for `crate::texstat`.
+        #[cfg(feature = "diagnostics")]
+        let note_hashed = |changed: bool| {
+            use crate::texstat::{T, add};
+            let (n, read, change) = if guarded {
+                (T::GuardedN, T::GuardedRead, T::GuardedChanged)
+            } else {
+                (T::OtherN, T::OtherRead, T::OtherChanged)
+            };
+            add(n, 1);
+            add(read, size as u64);
+            if changed {
+                add(change, size as u64);
+            }
+        };
         // A change the guard did not see: hashed at every check for a while.
         let found_blind = |last: &mut Last| {
             if blind && hot_textures() {
@@ -1424,11 +1476,21 @@ impl Staging {
                 }
                 last.hash = Some(hash);
                 if read.iter().all(|&b| b == 0) {
+                    #[cfg(feature = "diagnostics")]
+                    crate::texstat::add(crate::texstat::T::PartialZero, 1);
                     return false;
                 }
                 self.detile(read);
                 true
             });
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::texstat::add(crate::texstat::T::PartialN, 1);
+                crate::texstat::add(crate::texstat::T::PartialRead, size as u64);
+                if changed {
+                    crate::texstat::add(crate::texstat::T::PartialChanged, size as u64);
+                }
+            }
             #[cfg(feature = "diagnostics")]
             if changed {
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -1444,13 +1506,18 @@ impl Staging {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
+                    #[cfg(feature = "diagnostics")]
+                    note_hashed(false);
                     return size;
                 }
                 last.hash = Some(hash);
                 found_blind(last);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+                {
+                    note_hashed(true);
+                    crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+                }
                 size
             });
         }
@@ -1461,13 +1528,18 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
+            #[cfg(feature = "diagnostics")]
+            note_hashed(false);
             return size;
         }
         last.hash = Some(hash);
         found_blind(last);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+        {
+            note_hashed(true);
+            crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+        }
         size
     }
 

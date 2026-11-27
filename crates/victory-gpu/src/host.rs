@@ -8999,6 +8999,7 @@ impl Meter {
                     put[3]
                 );
                 traffic::line(self.copy_stats_frames as f64);
+                crate::texstat::log(self.copy_stats_frames as f64);
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
