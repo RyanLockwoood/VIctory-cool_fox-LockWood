@@ -42,6 +42,7 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    preludes: Mutex<PreludePool>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -1036,6 +1037,7 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
+            preludes: Mutex::new(PreludePool::default()),
             event,
             rtvs,
             rtv_size,
@@ -1277,6 +1279,39 @@ pub(crate) struct HostList {
 
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// State preludes belong to the host queue while submitted. Only completed
+/// pairs may be reset and recorded again.
+#[derive(Default)]
+struct PreludePool {
+    ready: Vec<Prelude>,
+    pending: std::collections::VecDeque<(u64, Prelude)>,
+    recording: Vec<Prelude>,
+}
+
+impl PreludePool {
+    fn reclaim(&mut self, completed: u64) {
+        // D3D12 reports UINT64_MAX when the device has been removed.
+        if completed == u64::MAX {
+            return;
+        }
+        while self.pending.front().is_some_and(|(fence, _)| *fence <= completed) {
+            let (_, prelude) = self.pending.pop_front().unwrap();
+            if self.ready.len() < 256 {
+                self.ready.push(prelude);
+            }
+        }
+    }
+
+    fn sent(&mut self, fence: u64) {
+        self.pending.extend(self.recording.drain(..).map(|prelude| (fence, prelude)));
+    }
+}
+
+fn prelude_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRELUDE_POOL").is_some_and(|v| v == "1"))
+}
 
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
@@ -4135,7 +4170,7 @@ impl Host {
                 None,
             )?;
             let prelude = OnceLock::new();
-            if !lazy_prelude() {
+            if !prelude_pool() && !lazy_prelude() {
                 let _ = prelude.set(self.make_prelude());
             }
             #[cfg(feature = "diagnostics")]
@@ -5697,10 +5732,16 @@ impl Host {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
         stage.next("submit: the lists' steps");
+        let mut preludes = prelude_pool().then(|| {
+            let mut pool = self.preludes.lock().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: a plain query on the fence for this host queue.
+            pool.reclaim(unsafe { self.fence.GetCompletedValue() });
+            pool
+        });
         for list in runs {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            if let Some(prelude) = list.prelude(self, preludes.as_deref_mut()) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -5798,6 +5839,9 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
+            if let Some(mut pool) = preludes.take() {
+                pool.sent(*submitted);
+            }
             #[cfg(feature = "diagnostics")]
             split.part(5);
             let back = crate::picked::with(declared, &picked.written);
@@ -5887,6 +5931,11 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        if let Some(mut pool) = preludes.take() {
+            // Even if the synchronous wait failed, only a later completed
+            // fence value on this queue can make these pairs reusable.
+            pool.sent(*submitted);
+        }
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
         let gpu = prepared.elapsed();
@@ -6703,7 +6752,7 @@ impl HostList {
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
     /// from the other, if a list submitted earlier left it behind.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    fn prelude(&self, host: &Host, pool: Option<&mut PreludePool>) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -6767,15 +6816,20 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() {
             return None;
         }
-        let Some((allocator, list)) = self
-            .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
-            .as_ref()
-        else {
+        let pair = if let Some(pool) = pool {
+            let Some(pair) = pool.ready.pop().or_else(|| host.make_prelude()) else {
+                fail(format_args!("no host list for a state prelude"));
+            };
+            pool.recording.push(pair);
+            pool.recording.last()
+        } else {
+            self.prelude.get_or_init(|| host.make_prelude()).as_ref()
+        };
+        let Some((allocator, list)) = pair else {
             fail(format_args!("no host list for a state prelude"));
         };
-        // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        // SAFETY: the prelude is new or its previous execution has finished.
+        // The textures are live.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
