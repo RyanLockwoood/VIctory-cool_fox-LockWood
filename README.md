@@ -1,3 +1,28 @@
+ Our branch came from a merge: e05d463 "Merge VIctory-7900XTX … with RTX 5090 fidelity & 32 GB RAM optimizations". An AMD fork (7900 XTX) was combined, and RTX 5090 optimizations were built in on top.
+- After that come clearly NVIDIA-specific adjustments:
+  - 8cc31ab "Port NVIDIA Wave32 lowering": NVIDIA cards compute in groups of 32, and the shaders are translated for that;
+  - 2e5001c "fract(NaN) … on NVIDIA";
+  - 97c78d1 "fix/nvidia-view-heap-cap";
+  - 4657dc5 "RTX 5090 residency experiments".
+- The AMD entries in the history (RDNA_FLOAT, PATCH_WAITS) mostly concern the console's chip: an Xbox has an AMD GPU, and Victory has to translate its instructions correctly. That's needed for every PC.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 ## Run the codec_d Windows build
