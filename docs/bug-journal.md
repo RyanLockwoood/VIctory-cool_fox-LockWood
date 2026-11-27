@@ -2,6 +2,22 @@
 
 ## 2026-11-27
 
+- **Two forks reviewed (read-only, GitHub API; nothing fetched into the repo).**
+  - **`Op-lite/victory-scarlett`** (branch `scarlett-fox`, based on our base `f4b48ad7`). Its README reports:
+    - **`VICTORY_LEVELS_ON_DEMAND=0` as "the largest single gain".** The cool_fox launcher (ours) sets 1, which keeps every texture's whole chain on the card. Off: re-uploads 6.4 GB → under 15 MB, ~4 GB less commit, fewer freezes. This is a setting in our build too, and it matches our counter finding of whole textures uploaded again.
+    - `VICTORY_CARD_AWAKE=0`: the keep-the-card-busy loop "held the card at 97–99 % in menus for no gain". Ours sets 1, which explains FrameView's ~92% GPU util.
+    - Freeze fix `VICTORY_SOFT_VIEWS=copies` (commit `bc264a41`, ~3,000 lines, `xmem.rs`/`watch.rs`): the views of the title's batch page-mapping copies are mapped only when touched. Freeze periods 10–12 → 3 per 6 minutes.
+    - Code-only switches not in our build: `VICTORY_PARTIAL_DELTA`/`BAKE_DELTA` (unchanged levels not uploaded again), `VICTORY_TABLE_MEMO` (81% of ~54,000 table entries a frame not rebuilt), `TABLE_NAMED_ONLY`, `QUEUE_MARKS`, `MAP_LOCK_FINE`, `POOL_CAP`/`POOL_DISCARD`.
+    - Their own figures: prologue 13–20 fps, first mission 19–22 fps; run-to-run noise 13–18 ms per frame.
+  - **`trustno1-coder/VIctory-NVIDIA`** (Series X 1440p, DLSS, frame generation; not for stable 30 fps):
+    - **`376f9832`**, "know the 32-bit heap by the kind the title really asks with" (+18/−3 in `xmem.rs`). The title reserves the 182 MB heap with kind 0x42000, without the 64 KiB page bits, so it was never recorded and `arrange` never applied. This is our "Scattered" refusal of port 1.
+    - `f1edd663` (submitting thread's work: host lists reused, batch kept, spread work wakes only needed threads; heap-record switches), built but "not yet measured in the game".
+  - **Order chosen (small steps):**
+    - (1) A settings-only A/B: `VICTORY_LEVELS_ON_DEMAND=0` against 1.
+    - (2) Then `VICTORY_CARD_AWAKE=0`.
+    - (3) Then the port-1 fix `376f9832`, as a cherry-pick.
+    - (4) Larger pieces later.
+
 - **Texture counter results, two cutscene passes** (`VIctory-bench/runs/counters-20261127-063357`, build `target/counters` at `4e7b763`, no PresentMon; window 5–375 s after the detected start; report `texstat_report.py`). Passes 1 / 2 agree closely:
   - **Uploads.** 196.2 / 193.5 GB in total.
     - First uploads: 12.4 / 12.4 GB (6.3 / 6.4%).
