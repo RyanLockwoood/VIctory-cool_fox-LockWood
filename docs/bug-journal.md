@@ -2,6 +2,23 @@
 
 ## 2026-11-27
 
+- **`VICTORY_CARD_AWAKE=0` wins: GPU load 96 → 41%, stutter time −45%, +10% fps.**
+  - Batch `VIctory-bench/runs/awake-ab-20261127-202148`, release `ports-only`, `LEVELS_ON_DEMAND=0`, 4 passes: A = 1 (the launchers' default), B = 0. GPU logged by `nvidia-smi` every second (`gpu.csv`).
+  - **PresentMon means A → B:**
+    - avg 22.5 → **24.8** frames/s
+    - p50 35.2 → 34.5 ms
+    - p95 79.2 → 67.3 ms
+    - **p99 179.5 → 125.3 ms**
+    - frames over 100 ms 256 → 169
+    - **frames over 250 ms 47.5 → 18**
+    - **seconds lost 56.8 → 31.5**
+    - B's pass 4 had one 2.0 s freeze (max), an outlier against its other figures.
+  - **GPU medians (passes 1A / 2B / 3A / 4B):** 114 / 106 / 111 / 106 W, **load 96 / 41 / 96 / 41 %**, 43–44 °C.
+  - Memory unchanged (private 34.6 → 34.1 GB, commit left 3.2 → 3.7 GB, VRAM 18.2 → 17.8 GB).
+  - The keep-the-card-busy loop only showed the card as busy, as Op-lite reported, and it also cost frame time.
+  - The player felt pass 2 (B) much smoother than pass 3 (A).
+  - **Now standard in the bench scripts** with `LEVELS_ON_DEMAND=0`. The launchers still default to 1; the stable `Play-VIctory.cmd` is the player's decision.
+
 - **Window switches A/B: worse, so they stay off.**
   - Batch `VIctory-bench/runs/win-ab-20261127-193852`, release `ports-only`, `LEVELS_ON_DEMAND=0`, 4 passes. A = defaults, B = `VICTORY_WINDOW_KB=1024` + `VICTORY_WINDOW_TAILS=1`, with `-MemoryMap`.
   - The script's "PresentMon not recording" warning was false: the UAC prompt was still open after its 5 s check. The check now waits up to 30 s.
