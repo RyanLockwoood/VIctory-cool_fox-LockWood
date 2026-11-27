@@ -2,6 +2,21 @@
 
 ## 2026-11-27
 
+- **What holds the RAM (read-only; new tool `VIctory-bench/Memory-Map-WS.ps1`, QueryWorkingSetEx per 4 KiB page, run by `Memory-Map.ps1` beside each map).** Leak-test pass `VIctory-bench/runs/leaktest-*`, end of the cutscene, release `ports-only`, `LEVELS_ON_DEMAND=0`.
+  - The walk found 22.92 GB resident (Windows working set 21.57 GB), of which 8 GB is shared.
+  - **Victory/driver private: 13.07 GB resident (31.59 committed):**
+    - **1–16 MB: 6.0 GB in 1,305**
+    - 256 MB–1 GB: 3.37 GB in 5 (three of ~1 GB)
+    - 16–64 MB: 2.4 GB
+    - 64–256 MB: 1.27 GB resident of 16.05 committed. These are the texture pool: card memory charged to commit, not RAM.
+  - The title's mapped pool: 3.86 GB, and Victory's second view of it at `0x18738f60000`: 3.18 GB of 3.88. These are the same physical pages counted twice per address, so real RAM is ~19 GB. Title private: 1.75 GB.
+  - **The diagnostics build's "memory, what holds it" line** (`copystat.rs`, from `counters2` at the cutscene's end):
+    - **1,560 host lists alive**
+    - **windows outside buffers (4 MiB grid): ~965, ~4.0 GB, of them 661 / 2,644 MB asked for without a length**
+    - our own allocations 1.86 GB in 1.69 M blocks
+  - This matches the other fork's digest (`Desktop/CLAUDE/references/DIGEST-FOR-MYTHOS.md`): host lists ~1.1–1.3 MB resident each, and windows 2.7–4.9 GB with ~1 GB of grid slack. Windows and host lists (with their allocators) are the likely owners of the 6 GB in 1–16 MB allocations.
+  - **RAM levers, in order:** trim windows to the asked span or a finer grid; pool host lists and share allocators per worker and frame (their milestone B); the texture-pool cap for commit.
+
 - **Where the memory goes, with `VICTORY_LEVELS_ON_DEMAND=0` (now the bench scripts' standard).** Pass `VIctory-bench/runs/memmap-20261127-075127`, release `ports-only`. A new read-only tool `VIctory-bench/Memory-Map.ps1` (VirtualQueryEx walk; option `Bench-Loop.ps1 -MemoryMap`) ran 6.5 min into the cutscene.
   - Windows private 33.2 GB, working set 22.0 GB.
   - Committed: private 32.75 GB in 200,253 allocations, mapped 15.34 GB in 94,128, image 0.74 GB.
