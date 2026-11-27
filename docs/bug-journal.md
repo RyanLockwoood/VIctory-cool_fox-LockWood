@@ -8,6 +8,11 @@
   - What remains of milestone B is allocator sharing per worker and frame, since each pooled list keeps its allocator at its high-water mark.
   - Unknown on this PC: how the 1,560 live lists split (idle pool / in flight / held) and what one costs in RAM. The digest's 1.1–1.3 MB per list is from an AMD card.
   - **Next (proposed, diagnostics only):** counters for that split, and a switch `VICTORY_LIST_IDLE_MOST` (default 512) for an A/B such as 512 against 64, before any allocator-sharing work.
+  - **Answered by the code's own measurements, so the experiment is dropped.**
+    - `host.rs` `LISTS`: "a host list cost 0.68 MB of private memory in run 69", so ~1.1 GB for our 1,560 lists, not the AMD digest's 2.7–7 GB.
+    - `list.rs` `IDLE_MOST`: "128 were too few … 12 % of the submitting thread", so a smaller pool costs CPU.
+    - Allocator sharing could save at most ~0.5–1 GB, at the risk of device loss. Deferred.
+    - Next: the texture-hash step (`HASH_EVERY` switch).
 - **`UNIFIED-MEMORY-SOLUTIONS(1).md` (NOTES) read.** It is written for the other (AMD) fork, and none of its seven switches exist in our build. It confirms that the cost is detection, not transfer (~1 ms of bus a frame). Its texture section asks for the same first measure as our counters: stop re-hashing unchanged memory. It also suggests reusing host textures by shape, and letting copies go when their title memory is unmapped. Saved to `Desktop/CLAUDE/references/`.
 
 - **`VICTORY_CARD_AWAKE=0` wins: GPU load 96 → 41%, stutter time −45%, +10% fps.**
