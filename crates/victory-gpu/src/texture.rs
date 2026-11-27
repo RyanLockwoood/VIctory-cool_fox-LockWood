@@ -1956,6 +1956,34 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
     true
 }
 
+/// A bounded diagnostic check of every region in a texture's backing.
+/// A failed query or an exhausted budget cannot confirm unmapped backing.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn unmapped_by_query(at: *const u8, len: usize, queries: &mut usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut cursor = at as usize;
+    let Some(end) = cursor.checked_add(len).filter(|_| cursor != 0 && len != 0) else {
+        return false;
+    };
+    while cursor < end {
+        if *queries == 0 {
+            return false;
+        }
+        *queries -= 1;
+        // SAFETY: the query inspects address metadata and fills the output.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let n = unsafe { VirtualQuery(cursor as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 || !matches!(info.State, MEM_FREE | MEM_RESERVE) {
+            return false;
+        }
+        let Some(next) = (info.BaseAddress as usize).checked_add(info.RegionSize).filter(|&next| next > cursor) else {
+            return false;
+        };
+        cursor = next;
+    }
+    true
+}
+
 /// How many bytes of `[at, at + len)` are committed memory: all of a
 /// texture that is there, some of one streaming in (its smaller mips lie
 /// at the start of its memory, and their pages are mapped first), none of
@@ -2156,6 +2184,32 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn an_unmapped_backing_check_rejects_a_committed_middle_page() {
+        use super::unmapped_by_query;
+        use windows_sys::Win32::System::Memory::*;
+
+        const PAGE: usize = 4096;
+        const SIZE: usize = 3 * PAGE;
+        // SAFETY: this test owns the reservation and releases it before asserting.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            let reserved = unmapped_by_query(base, SIZE, &mut 1);
+            let unverified = unmapped_by_query(base, SIZE, &mut 0);
+            let middle = base.add(PAGE).cast();
+            let committed = VirtualAlloc(middle, PAGE, MEM_COMMIT, PAGE_NOACCESS);
+            let partial = unmapped_by_query(base, SIZE, &mut 3);
+            let released = VirtualFree(base.cast(), 0, MEM_RELEASE);
+            assert_ne!(released, 0);
+            assert_eq!(committed, middle);
+            assert!(reserved);
+            assert!(!unverified);
+            assert!(!partial);
+        }
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does

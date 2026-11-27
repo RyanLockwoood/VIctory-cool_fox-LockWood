@@ -730,7 +730,16 @@ fn log_memory() {
     let made: Vec<u64> = crate::host::MADE.iter().map(|m| m.load(Relaxed)).collect();
     let windows = crate::shadow::windows();
     let stagings = crate::texture::let_go();
-    let census = crate::resource::census();
+    let (census, unmapped) = crate::resource::census();
+    if let Some(unmapped) = unmapped {
+        tracing::info!(
+            checked = unmapped.checked,
+            confirmed = unmapped.confirmed,
+            confirmed_host_mib = mb(unmapped.bytes),
+            region_queries = unmapped.queries,
+            "sampled idle placed texture copies with fully uncommitted backing"
+        );
+    }
     let kinds: Vec<u64> = crate::resource::KINDS.iter().map(|k| k.load(Relaxed)).collect();
     let card = crate::host::host()
         .and_then(|h| h.video_memory())

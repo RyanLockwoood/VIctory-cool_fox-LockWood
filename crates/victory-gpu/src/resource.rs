@@ -2257,8 +2257,17 @@ pub(crate) fn targets_census() -> [u64; 12] {
 /// estimates from every 16th such texture: asking Windows about the memory
 /// of all 16,000 takes too long.
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn census() -> [u64; 10] {
+pub(crate) fn census() -> ([u64; 10], Option<UnmappedCensus>) {
+    use std::sync::atomic::Ordering::Relaxed;
+
     const EVERY: u64 = 16;
+    static CHECK_BACKING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let check_backing = *CHECK_BACKING.get_or_init(|| {
+        std::env::var_os("VICTORY_TEXTURE_UNMAPPED_CENSUS").is_some_and(|v| v == "1")
+    });
+    const QUERY_LIMIT: usize = 16;
+    let mut queries = if check_backing { QUERY_LIMIT } else { 0 };
+    let mut unmapped = UnmappedCensus::default();
     let mut count = [0u64; 10];
     let mut placed_filled = 0u64;
     let all = textures();
@@ -2285,6 +2294,20 @@ pub(crate) fn census() -> [u64; 10] {
                         if crate::host::references(&host.texture) > 1 {
                             count[9] += host.bytes * EVERY;
                         }
+                        let used = r.host.used.load(Relaxed);
+                        if queries > 0 && used != 0 && fills(&r.desc)
+                            && crate::host::long_ago(used, 30_000, 60)
+                            && std::sync::Arc::strong_count(host) == 1
+                            && crate::host::references(&host.texture) == 1
+                            && !crate::texture::host_wrote(at)
+                            && let Some(len) = texture_layout(&r.desc).and_then(|layout| usize::try_from(layout.size).ok())
+                        {
+                            unmapped.checked += 1;
+                            if crate::texture::unmapped_by_query(r.data(), len, &mut queries) {
+                                unmapped.confirmed += 1;
+                                unmapped.bytes += host.bytes;
+                            }
+                        }
                     }
                 }
             }
@@ -2294,7 +2317,17 @@ pub(crate) fn census() -> [u64; 10] {
             }
         }
     }
-    count
+    unmapped.queries = QUERY_LIMIT - queries;
+    (count, check_backing.then_some(unmapped))
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+#[derive(Default)]
+pub(crate) struct UnmappedCensus {
+    pub(crate) checked: u64,
+    pub(crate) confirmed: u64,
+    pub(crate) bytes: u64,
+    pub(crate) queries: usize,
 }
 
 /// Host textures alive (the title's and the twins) and the bytes the host
