@@ -2,6 +2,20 @@
 
 ## 2026-11-27
 
+- **`VICTORY_PLACED_FIELDS=1` (padding words left out, commit `8123d60`, off unless set): shapes grow 30% slower, but still grow.**
+  - Pass `VIctory-bench/runs/padding-*`, diagnostics build `target/counters`. Compared with `counters2` (same build without the fix), "shapes of placed views kept" at the same cutscene seconds:
+
+    | Seconds | Without the fix | With the fix |
+    |---:|---:|---:|
+    | 60 | 230,203 | 145,369 |
+    | 180 | 708,429 | 468,937 |
+    | 360 | 1,138,319 | 796,003 |
+
+  - Still ~130,000 new shapes a minute, so the 4,194,304 cap would be reached after ~40 instead of ~30 minutes. Other words of the descriptions must vary too.
+  - Diagnostics suite 397 passed (two known failures), with the new test `only_the_padding_words_are_cleared_and_only_when_asked` and compile-time layout checks in `resource.rs`. No picture problem was reported.
+  - Next memory step: trustno1's cap on ownerless views (`89fd9361`).
+  - Then, per the player: an audit of what came in with the VIctory-7900XTX merge (`e05d463`), sorted into neutral / AMD-specific / switch defaults, to replace AMD-specific parts with NVIDIA ones only where measured better.
+
 - **`VICTORY_TEXTURE_HASH_EVERY` (new switch, commit `8276b80`, default 8): A/B inconclusive, kept at 8.**
   - Batch `VIctory-bench/runs/hash-ab-20261127-212537`, build `target/hash-every` (release, `LEVELS_ON_DEMAND=0`, `CARD_AWAKE=0`). A = 8, B = 32.
   - **Per pass (1A / 2B / 3A / 4B):**
