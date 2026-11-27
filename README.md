@@ -1,4 +1,4 @@
-# VIctory on an RX 7900 XTX
+
 
 ## Run the codec_d Windows build
 
