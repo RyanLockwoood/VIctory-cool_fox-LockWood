@@ -2,6 +2,12 @@
 
 ## 2026-11-27
 
+- **Leak test: no steady leak** (`VIctory-bench/runs/leaktest-*`, release `ports-only`, `LEVELS_ON_DEMAND=0`; cutscene, then 15 min standing still from 08:09:26).
+  - Private memory during the hold (t = 549 → 735 → 862 → 1001 → 1146 → 1444 s): 36.0 → 35.8 → 36.8 → 37.7 → 37.7 → 37.8 GB. One step of +1.9 GB around 860–1000 s, then flat: +0.06 GB over the last ~7 min.
+  - Working set ~19–20 GB flat; texture pool 14.85 GB flat; commit left 4.2 → 2.3 GB.
+  - RAM map at the hold's end: working set 19.45 GB, resident 20.83 GB (9.47 GB shared).
+  - **Next RAM step proposed:** an A/B of the existing, never-measured window switches `VICTORY_WINDOW_KB=1024` + `VICTORY_WINDOW_TAILS=1` (`shadow.rs` ~5106–5160), against windows of ~4 GB (2.6 GB of them asked for without a length).
+
 - **What holds the RAM (read-only; new tool `VIctory-bench/Memory-Map-WS.ps1`, QueryWorkingSetEx per 4 KiB page, run by `Memory-Map.ps1` beside each map).** Leak-test pass `VIctory-bench/runs/leaktest-*`, end of the cutscene, release `ports-only`, `LEVELS_ON_DEMAND=0`.
   - The walk found 22.92 GB resident (Windows working set 21.57 GB), of which 8 GB is shared.
   - **Victory/driver private: 13.07 GB resident (31.59 committed):**
