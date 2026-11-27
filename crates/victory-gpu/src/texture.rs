@@ -128,6 +128,40 @@ const HOT_FRAMES: u64 = 64;
 /// the start (the six-star screen of the first seconds, which the hash
 /// never caught changing). `VICTORY_TEXTURE_HOT=0`: every eighth frame
 /// only, as before.
+/// Every how many frames a guarded texture the guard saw no write to is
+/// hashed anyway, to catch a write through another view of its pages
+/// (`VICTORY_TEXTURE_HASH_EVERY`, a power of two from 1 to 256; 8 unless
+/// set). In the opening cutscene this turn hashed ~140 GB in 370 s, 79 % of
+/// all guarded hashing, and found ~1 % of it changed (counters2 run,
+/// 2026-11-27); hot textures are still hashed at every check.
+fn hash_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| hash_every_from(std::env::var("VICTORY_TEXTURE_HASH_EVERY").ok().as_deref()))
+}
+
+fn hash_every_from(setting: Option<&str>) -> u64 {
+    match setting.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(n) if n.is_power_of_two() && n <= 256 => n,
+        _ => 8,
+    }
+}
+
+#[cfg(test)]
+mod hash_every_tests {
+    #[test]
+    fn the_turn_is_eight_unless_a_power_of_two_up_to_256_is_set() {
+        use super::hash_every_from as f;
+        assert_eq!(f(None), 8);
+        assert_eq!(f(Some("32")), 32);
+        assert_eq!(f(Some(" 1 ")), 1);
+        assert_eq!(f(Some("256")), 256);
+        assert_eq!(f(Some("512")), 8);
+        assert_eq!(f(Some("24")), 8);
+        assert_eq!(f(Some("0")), 8);
+        assert_eq!(f(Some("x")), 8);
+    }
+}
+
 fn hot_textures() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HOT").is_none_or(|v| v != "0"))
@@ -1403,13 +1437,12 @@ impl Staging {
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
-            const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let frame = crate::frame::current();
             let turn = frame
                 .wrapping_add((start >> 16) as u64)
-                .is_multiple_of(HASH_EVERY);
+                .is_multiple_of(hash_every());
             // A texture starts hot: one written that way from its first
             // frames on changes before the hash has ever caught it.
             if last.hot_until == 0 {
