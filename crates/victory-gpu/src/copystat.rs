@@ -733,10 +733,13 @@ fn log_memory() {
     let (census, unmapped) = crate::resource::census();
     if let Some(unmapped) = unmapped {
         tracing::info!(
+            candidates = unmapped.candidates,
+            candidate_host_mib = mb(unmapped.candidate_bytes),
             checked = unmapped.checked,
             confirmed = unmapped.confirmed,
             confirmed_host_mib = mb(unmapped.bytes),
             region_queries = unmapped.queries,
+            wrapped = unmapped.wrapped,
             "sampled idle placed texture copies with fully uncommitted backing"
         );
     }

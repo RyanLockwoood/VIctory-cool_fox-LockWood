@@ -2258,7 +2258,7 @@ pub(crate) fn targets_census() -> [u64; 12] {
 /// of all 16,000 takes too long.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn census() -> ([u64; 10], Option<UnmappedCensus>) {
-    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
     const EVERY: u64 = 16;
     static CHECK_BACKING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2266,6 +2266,9 @@ pub(crate) fn census() -> ([u64; 10], Option<UnmappedCensus>) {
         std::env::var_os("VICTORY_TEXTURE_UNMAPPED_CENSUS").is_some_and(|v| v == "1")
     });
     const QUERY_LIMIT: usize = 16;
+    static NEXT_BACKING: AtomicUsize = AtomicUsize::new(0);
+    let from = if check_backing { NEXT_BACKING.load(Relaxed) } else { 0 };
+    let mut next = from;
     let mut queries = if check_backing { QUERY_LIMIT } else { 0 };
     let mut unmapped = UnmappedCensus::default();
     let mut count = [0u64; 10];
@@ -2291,21 +2294,27 @@ pub(crate) fn census() -> ([u64; 10], Option<UnmappedCensus>) {
                     // and are mapped first and unmapped last.
                     if placed_filled.is_multiple_of(EVERY) && !crate::texture::committed(r.data().cast_const(), 1) {
                         count[8] += host.bytes * EVERY;
-                        if crate::host::references(&host.texture) > 1 {
+                        let references = crate::host::references(&host.texture);
+                        if references > 1 {
                             count[9] += host.bytes * EVERY;
                         }
                         let used = r.host.used.load(Relaxed);
-                        if queries > 0 && used != 0 && fills(&r.desc)
+                        if check_backing && used != 0 && fills(&r.desc)
                             && crate::host::long_ago(used, 30_000, 60)
                             && std::sync::Arc::strong_count(host) == 1
-                            && crate::host::references(&host.texture) == 1
+                            && references == 1
                             && !crate::texture::host_wrote(at)
                             && let Some(len) = texture_layout(&r.desc).and_then(|layout| usize::try_from(layout.size).ok())
                         {
-                            unmapped.checked += 1;
-                            if crate::texture::unmapped_by_query(r.data(), len, &mut queries) {
-                                unmapped.confirmed += 1;
-                                unmapped.bytes += host.bytes;
+                            unmapped.candidates += 1;
+                            unmapped.candidate_bytes += host.bytes;
+                            if at >= from && queries > 0 {
+                                next = at.saturating_add(1);
+                                unmapped.checked += 1;
+                                if crate::texture::unmapped_by_query(r.data(), len, &mut queries) {
+                                    unmapped.confirmed += 1;
+                                    unmapped.bytes += host.bytes;
+                                }
                             }
                         }
                     }
@@ -2318,16 +2327,24 @@ pub(crate) fn census() -> ([u64; 10], Option<UnmappedCensus>) {
         }
     }
     unmapped.queries = QUERY_LIMIT - queries;
+    if check_backing {
+        // After reaching the end, the next census starts at the beginning.
+        unmapped.wrapped = queries > 0;
+        NEXT_BACKING.store(if unmapped.wrapped { 0 } else { next }, Relaxed);
+    }
     (count, check_backing.then_some(unmapped))
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
 #[derive(Default)]
 pub(crate) struct UnmappedCensus {
+    pub(crate) candidates: u64,
+    pub(crate) candidate_bytes: u64,
     pub(crate) checked: u64,
     pub(crate) confirmed: u64,
     pub(crate) bytes: u64,
     pub(crate) queries: usize,
+    pub(crate) wrapped: bool,
 }
 
 /// Host textures alive (the title's and the twins) and the bytes the host
