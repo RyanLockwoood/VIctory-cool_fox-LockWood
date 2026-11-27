@@ -2,6 +2,19 @@
 
 ## 2026-11-27
 
+- **Second counters, one cutscene pass** (`VIctory-bench/runs/counters2-20261127-065309`, build `target/counters` at `6edd6a5`, no PresentMon).
+  - **Guarded hashing by reason** (139.9 GB hashed, 1.1 GB changed):
+    - **the eighth-frame turn: 139.6 GB (79%)**;
+    - hot: 32.0 GB (18%);
+    - bake exact: 4.7 GB;
+    - write seen: 0.3 GB;
+    - never-hashed staging buffers only 4.5 GB.
+    - The suspected "fresh staging starts hot" link is refuted. The fixed `HASH_EVERY = 8` turn (`texture.rs`, guard path) is what hashes ~99%-unchanged textures.
+  - **Detiled and uploaded although the hash equals what the host copy holds: 27,421 times, 15.4 GB** (~8% of the uploads).
+  - Uploads by upload count as before (1st 6.6%, 10th+ 44.5%).
+  - **The player saw an all-grey picture in this pass.** The queue showed 6,391 textures waiting for their memory (previous pass 411, the oldest due 1,105 frames ago) and 1.6 GB of commit left (previous 4.8 GB). It reads as grey `SHOW_AFTER` stand-ins under memory pressure in the diagnostics build, not as an effect of the counters, which change no behaviour. Whether it was grey all along is asked.
+  - **Code candidates, after the A/B:** a longer turn behind a switch (e.g. 32), and skipping a detile/upload whose hash equals the host copy's.
+
 - **Marvisak/VIctory and its five most-starred forks reviewed (read-only).**
   - Main repo: last push 2026-11-25. Correctness fixes for shaders and the GPU, some not in our tree (e.g. "the depth bounds test reaches the host"). Picture work, for the visuals phase.
   - `DexNom/VIctory` (1,308 ★): "RayTime", aimed at AMD, FSR and ray tracing. Not for us.
