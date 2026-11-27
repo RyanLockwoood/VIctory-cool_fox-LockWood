@@ -2,6 +2,29 @@
 
 ## 2026-11-27
 
+- **`VICTORY_LEVELS_ON_DEMAND=0` wins clearly: half the stutter time, 11 GB less RAM, 12 GB less VRAM.**
+  - Batch `VIctory-bench/runs/lod-ab-20261127-070703`: build `target/ports-only` (release, `6b24606`), Series S, standard settings. Four cutscene passes in alternating order: A = 1 (the launcher's default) / B = 0.
+  - The batch's own PresentMon had died beside a left-over instance from the interrupted batch, so it was started by hand at 07:07:48, before pass 1's cutscene. The script now warns if PresentMon is not recording.
+  - **PresentMon, 375 s windows, means A → B** (passes 1A / 3A against 2B / 4B):
+    - avg 20.2 → **22.9** frames/s
+    - p50 39.6 → 38.0 ms
+    - p95 91.7 → **77.6** ms
+    - **p99 219 → 132 ms**
+    - **max 1,326 → 548 ms**
+    - frames over 100 ms 315 → 213
+    - **frames over 250 ms 61.5 → 12.5**
+    - **seconds lost above 50 ms 72.3 → 38.5**
+    - Spreads within a side are small (B: p50 0.1 ms, p99 10 ms).
+  - **Victory's log, same windows (A 1/3 → B 2/4):**
+    - **private memory 45.2/46.1 → 34.8/34.2 GB**
+    - **commit left 0.1/0.1 → 2.2/2.9 GB**
+    - **VRAM used 29.9/30.0 → 18.4/18.0 GB**
+    - texture upload 41.6/42.6 → 25.0/26.0 MB a frame
+    - preparing 34.8/36.6 → 35.0/32.9 ms
+  - **The grey picture:** the player reported pass 1 (A) all grey (~9,900 textures waiting, 0.6 GB RAM free, commit at 0.1 GB) and pass 2 (B) normal. The grey picture is a memory-exhaustion symptom of A.
+  - **Reading:** with `=1` every texture keeps its whole level chain on the card (`crate::tiles`), which fills VRAM, then commit, and drives eviction and re-upload. This matches Op-lite's report (re-uploads 6.4 GB → 15 MB, ~4 GB commit).
+  - **Decision proposed:** make `VICTORY_LEVELS_ON_DEMAND=0` the test launchers' setting. The stable `Play-VIctory.cmd` (repo root) is left to the player's decision.
+
 - **Second counters, one cutscene pass** (`VIctory-bench/runs/counters2-20261127-065309`, build `target/counters` at `6edd6a5`, no PresentMon).
   - **Guarded hashing by reason** (139.9 GB hashed, 1.1 GB changed):
     - **the eighth-frame turn: 139.6 GB (79%)**;
