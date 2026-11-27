@@ -98,6 +98,13 @@ pub(crate) struct ResourceDesc {
     flags: u32,
 }
 
+// `crate::descriptor::placed_resource_words` treats words 1 and 13 as padding:
+// the dimension is word 0, the alignment begins at word 2 and the flags are
+// word 12 of the 56 bytes.
+const _: () = assert!(std::mem::offset_of!(ResourceDesc, alignment) == 8);
+const _: () = assert!(std::mem::offset_of!(ResourceDesc, flags) == 48);
+const _: () = assert!(size_of::<ResourceDesc>() == 56);
+
 #[cfg(windows)]
 impl ResourceDesc {
     /// The texture of this one's levels from `base` on.

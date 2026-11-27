@@ -1323,6 +1323,32 @@ pub(crate) extern "system" fn create_uav(
     record(handle, view);
 }
 
+/// Whether a placed view keeps only the fields of the resource description
+/// it is given (`VICTORY_PLACED_FIELDS=1`; off unless set). Words 1 and 13
+/// of the 56-byte description are padding (before the 8-byte alignment, and
+/// after the flags) that the title may leave unwritten: the same view came
+/// in with other bytes there and each was a new shape. A 7-minute cutscene
+/// pass made 1,153,264 shapes of the 4,194,304 there is room for (counters2,
+/// 2026-11-27); once they are full every placed view is a table entry kept
+/// for the run (trustno1-coder/VIctory-NVIDIA 4eead678, from
+/// JMAN730/project-flamingo b1e0cd1d: 16.7 GB after 70 minutes).
+fn placed_fields() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_FIELDS").is_some_and(|v| v == "1"))
+}
+
+/// The resource description of a placed view, its padding words 0
+/// ([`placed_fields`]): word 0 is the dimension, words 2 to 12 the
+/// alignment through the flags (`crate::resource::ResourceDesc`).
+fn placed_resource_words(desc: *const [u32; 14], fields_only: bool) -> Option<[u32; 14]> {
+    let mut words = words(desc)?;
+    if fields_only {
+        words[1] = 0;
+        words[13] = 0;
+    }
+    Some(words)
+}
+
 /// Device methods 0x230 and 0x238: shader resource and unordered access
 /// views of memory the title placed itself, `(resource desc, view desc,
 /// handle)`.
@@ -1332,7 +1358,7 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(resource), Some(desc)) = (placed_resource_words(resource, placed_fields()), words(desc)) {
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -1343,8 +1369,30 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(resource), Some(desc)) = (placed_resource_words(resource, placed_fields()), words(desc)) {
         record(handle, View::Placed(true, resource, desc));
+    }
+}
+
+#[cfg(test)]
+mod placed_fields_tests {
+    use super::placed_resource_words;
+
+    #[test]
+    fn only_the_padding_words_are_cleared_and_only_when_asked() {
+        let mut resource = [3, 0xaaaa_aaaa, 64, 0, 8, 0, 8, 0x10001, 28, 1, 0, 0, 0, 0xbbbb_bbbb];
+        let asked = placed_resource_words(&resource, true).unwrap();
+        assert_eq!(asked, [3, 0, 64, 0, 8, 0, 8, 0x10001, 28, 1, 0, 0, 0, 0]);
+        // Two descriptions that differ in padding alone give the same words.
+        resource[1] = 0x1234;
+        resource[13] = 0x5678;
+        assert_eq!(placed_resource_words(&resource, true).unwrap(), asked);
+        // A real field still tells them apart.
+        resource[12] = 4;
+        assert_ne!(placed_resource_words(&resource, true).unwrap(), asked);
+        // Off: the words as given, padding and all.
+        assert_eq!(placed_resource_words(&resource, false).unwrap(), resource);
+        assert_eq!(placed_resource_words(std::ptr::null(), true), None);
     }
 }
 
