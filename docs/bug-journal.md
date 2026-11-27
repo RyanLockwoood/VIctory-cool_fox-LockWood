@@ -2,6 +2,22 @@
 
 ## 2026-11-27
 
+- **`VICTORY_TEXTURE_HASH_EVERY` (new switch, commit `8276b80`, default 8): A/B inconclusive, kept at 8.**
+  - Batch `VIctory-bench/runs/hash-ab-20261127-212537`, build `target/hash-every` (release, `LEVELS_ON_DEMAND=0`, `CARD_AWAKE=0`). A = 8, B = 32.
+  - **Per pass (1A / 2B / 3A / 4B):**
+    - avg 21.4 / 25.7 / 25.7 / 25.3 frames/s
+    - p99 222.5 / 103.6 / 105.3 / 115.9 ms
+    - seconds lost 68.5 / 23.0 / 22.7 / 28.0
+  - Pass 1A is an outlier; 3A matches the B passes, so no gain is shown. B did no harm (same memory, no picture report). The counter effect (hashed MB) was not measured in this release batch.
+  - Tests: release suite 344 passed (two known failures), including `the_turn_is_eight_unless_a_power_of_two_up_to_256_is_set`.
+  - **The overall level with today's two settings:** ~25 frames/s and ~23–28 s of stutter per 375 s, against ~20 frames/s and ~67–72 s this morning.
+- **Repos checked:**
+  - `trustno1-coder/VIctory-NVIDIA`: **padding-word fix `4eead678`.** Placed views hashed two unwritten words of the resource description, which filled the 2^22 shape table and then kept every view: "16.7 GB after 70 minutes on Series S". **Our `descriptor.rs` `shape_of` copies the whole description too, so the same leak is in our build.** Our 15-minute standing test could not show it. The cap `89fd9361` is a second safety net.
+  - `oliking800/victory-agility-patcher`: Windows 10 only. Not for us.
+  - `Op-lite/victory-scarlett`: gone (404); its README is kept in the handoff `analysis/`.
+  - `skornuta/victory-memory-stack`: 27 patches (VRAM 12.6 → 8.55 GB, working set 15.1 → 12.85 GB, same fps): GPU detile, slot eviction, allocator trim, prelude pool, budget pack, compare pieces, pool caps. None of its switches exist in our build, and its base `e94251a` is not in our history, so it must be ported feature by feature. The author removed the license file on 2026-11-27.
+- **Windows:** 26H2 (build 26300.9974) with **Memory Integrity (HVCI) on**, which makes faults, protection changes and kernel calls dearer. An on/off test needs the player to switch it and reboot.
+
 - **Host command lists, read-only (for the NOTES plan's milestone B).**
   - Each `HostList` (`host.rs` `make_list`) owns its own allocator and list. Its prelude (a second allocator and list) is made lazily: `VICTORY_LAZY_PRELUDE`, on by default.
   - **List pooling exists already** (`list.rs`: `VICTORY_LIST_POOL`, on by default). `recycle` resets lists whose submission ran and keeps them for `fresh_list`, up to `IDLE_MOST` = 512 lists / 256 MB. With `VICTORY_THIN=1` the title's lists get no host list at creation.
