@@ -1,5 +1,55 @@
 # GPU residency bug journal
 
+## 2026-11-27
+
+- **What the cutscene stalls are (read-only, `runs/base-20261127-051611`, new tool `VIctory-bench/stall_timeline.py`).** PresentMon's seconds lost per 5 s were set next to every counter in Victory's log.
+  - **Correlation with seconds lost, passes 1 / 2 / 3:**
+    - texture refresh time ("texture refreshes per frame, all threads", the reading, hashing and detiling): **r = +0.78 / +0.84 / +0.81**
+    - texture upload bytes: +0.64 / +0.67 / +0.68
+    - evicted MB: +0.57 / +0.57 / +0.68
+    - free RAM: −0.46 / −0.56 / −0.53
+    - commit trims, waits for new memory, and textures changed after their upload: weak (≤ 0.4)
+    - "card idle" (+0.9) is the consequence of long frames, not a cause.
+  - **Magnitudes in pass 1, per 10 s:** in stall stretches texture refresh runs 15–40 ms a frame, against 3–6 ms in calm ones; texture uploads 7–10 GB, against 2–3 GB; and evictions of 1–4 GB come together with them.
+  - **During stalls the card waits on both sides.** Our submitting thread works 25–43 ms a frame, against ~15 ms calm, and the title also submits late (one second: 124 ms idle, 41 of it behind us).
+  - **Upload volume over the 380 s window (pass 1, memory-sample totals):**
+    - 202 GB of texture uploads recorded, ~0.5 GB/s and about 9× the 22 GB texture pool, so the same textures are uploaded many times.
+    - By path: 137.5 GB textures picked by index (`UploadPath::Prefetch`, the tables' texture pass, the main path for bindless textures), 41.5 GB bake, 23.3 GB draws.
+    - Only **4.0 GB** were first uploads after an eviction.
+    - `texture_heap_pass_us` grew by 165 s, about 43% of one core across the window.
+  - **Evictions.** Two kinds evicted textures in the window:
+    - VRAM keep rule (`host.rs` `vram_keep`): used ≥ 88% of the DXGI budget lets go of textures idle ≥ 5 s down to 85%, **1.0–1.7 GB at a time, 24 times**. Used was ~29.7 of 31.1 GB.
+    - Commit trim (`residency.rs`, commit or, with `VICTORY_TEXTURE_RAM_TRIM=1`, physical RAM below 1.5 GiB): 128 MB at a time, 54 times.
+    - Memory pressure is real, but re-uploads after eviction are ~2% of the volume, so it is a side effect, not the main cause.
+  - **Conclusion.** The freezes are the cutscene's streaming moments, where Victory re-reads, hashes, detiles and uploads texture data on the CPU at up to ~1 GB/s.
+  - **Next, needs GO:** diagnostics-only counters of *why* a texture is uploaded again (first upload, hash found a change, new mip level, memory reused by another texture, after eviction), and how much hashing finds nothing changed. These tell which fix pays: skipping unchanged data, uploading only the changed levels, or detiling on the card.
+
+- **New benchmark: the opening cutscene, automated, with PresentMon. First baseline (3 passes).**
+  - **Method:**
+    - Tools are in `C:\Users\zbori\VIctory-bench\`. `Bench-Loop.ps1` runs each pass from a fresh start: story saves moved to `C:\Users\zbori\cool_fox-backups\saves-20261127\`, then `VICTORY_KEYS=20:Enter,24:Enter,28:Enter` presses "PLAYER (A)" on the account picker. The cutscene starts ~55 s after launch and lasts ~394 s, detected as the first 5-second host line with ≥500 draws. The game is closed 400 s later.
+    - One PresentMon 2.6.0 session records every frame of all passes. `bench_report.py` cuts the same 380 s window (from 5 s after the detected start) out of each pass, from PresentMon and from Victory's log.
+    - The game ignores the window close once the cutscene has ended, so all three passes were force-closed after 60 s. Future batches close before the cutscene ends.
+    - PresentMon's GPUBusy (~36 ms of a ~37 ms frame) is not usable for Victory: it counts queued work waiting on fences as busy. Our own timestamp counter stays the GPU measure. PresentMon's frame times are exact.
+  - **Baseline** `runs/base-20261127-051611`: build `target/ports-only` (`6b24606`, release), Series S, ports off, standard settings, cache copy `cache-pareto-ports`. Per pass (1 / 2 / 3):
+    - avg 20.5 / 21.2 / 21.5 frames/s; p50 38.2 / 37.1 / 37.4 ms; p95 98 / 95 / 85 ms; p99 231 / 200 / 184 ms; max 2590 / 1260 / 1489 ms
+    - frames over 100 ms: 377 / 361 / 287; over 250 ms: 70 / 57 / 53; time lost above 50 ms: 73.6 / 67.4 / 61.7 s of 380 s
+    - Victory's log: preparing 33.1 / 31.6 / 33.7 ms, copies 13.2 / 13.4 / 14.5 ms
+    - Across passes the medians agree within ~1 ms and avg fps within 1 frame/s; the tail spreads more (p99 ±25 ms).
+  - **The stalls are tied to the content.** In all three passes the frames over 250 ms bunch at the same cutscene seconds: ~105–115, ~155–175, and above all 260–310 s and later. Frames over 100 ms per 20 s rise from ~5 to 40–59 from the 4th minute on. So they come from what the scene loads or shows, not chance, and they can be targeted.
+  - **Memory is at the edge in Series S too.** Available commit fell to **0.1–0.2 GB** in every pass (private ~45 GB, VRAM ~29.7 of 31.4 GB). The player felt pass 3 was the worst; by the counts it was the best, but its worst freezes came bunched together (292 s: 1.5 s, 295 s: 0.8 s, 298 s, 303–304 s).
+  - The manual first run with F10 (`runs/intro-base-20261127-050329`, two pieces because of an accidental F10) showed the same picture: p99 182 / 395 ms, max 640 / 1819 ms.
+
+- **Series X mode, ports A/B: the ports do not engage in Series X either; Series X does not fit this PC's memory.** Build `target/ports-only` (release, `6b24606`), new launcher `target/ports-only/Play-VIctory-seriesX.cmd` (only `--console series-x` differs), cache copy `cache-pareto-ports`, usual settings incl. `VICTORY_HEAP_SYNC_EARLY=2`, `victory_gpu::port`/`port_cbv` logged.
+  - **Run A, ports off:** `X-A-off-20261127-043741.stderr.log`. Windows (UTC): stand 03:39:40–03:43:09, spin 03:43:09–03:43:57, stand 03:44:00–03:45:25, spin 03:45:25–03:46:03, stand 03:46:03–03:49:24, spin 03:49:24–03:50:38.
+  - Medians of the 5-second host lines, three standing windows: 20.7 / 20.9 / 21.8 frames/s, preparing 33.3 / 34.6 / 31.4 ms, copies 16.4 / 16.2 / 14.5 ms, copy-back 8.0–8.9 ms.
+  - Three spinning windows: 8.9 / 12.6 / 13.0 frames/s at 112 / 79 / 77 ms a frame, while preparing stayed at 31.8 / 31.7 / 36.7 ms and texture uploads rose from ~40 to ~90 MB a frame. The extra spin time is not the submitting thread.
+  - Memory: process private memory reached 48.4 GB, available commit fell to **0.2 GB** (twice), free RAM to 0.5 GB, and VRAM used ~30 of 31.4 GB. The "new memory waited for" total grew ~97 ms per second standing and ~174 ms per second spinning (stand 3 / spin 3), on a 31 GB PC with a 32–64 GB page file.
+  - Against Series S on the same build (`A-off-20261126-202223`, 18.5 standing / 16.4 spinning, preparing 40.6 / 47.8): standing is about the same or a bit better, spinning much worse.
+  - **Run B, ports on** (`VICTORY_PORT_CONSTANTS=1 VICTORY_PORT_CBV=1`, `X-B-on-20261127-045153.stderr.log`): port 1 refused the 182 MB graphics reservation (`0x8a80000`) as "not one stretch of a section: Scattered", exactly as in Series S. It placed 0 regions in all 70 status lines, so port 5 had nothing in place. Stopped after ~1 minute without a routine, since it was the same code as run A.
+  - **Decisions:** Series S stays the working mode. The ports do not engage on our build in either mode; why `arrange` (`xmem.rs`, `41e2adf`) does not make the reservation one stretch is an open read-only question.
+  - This was the last stand-and-spin run: the player is switching to a new benchmark method.
+  - Side note: Series S is tight too. At the end of `A-off-20261126-202223`, private memory was 33.9 GB (about 4.4× the 7.6 GB of title memory) with 1.35 GB of commit left.
+
 ## 2026-11-26
 
 - **Ports-only A/B: the ports did not engage in Series S mode.** `target/ports-only/A-off-20261126-202223` vs `B-on-20261126-202640` (`VICTORY_PORT_CONSTANTS=1 VICTORY_PORT_CBV=1`), same build and settings, back to back. Port 1 placed 0 regions: the 182 MB graphics reservation at `0x37600000` was refused twice as "not one stretch of a section: Scattered", which `5e0c9ab` did not cover here; port 5 therefore had nothing in place (16,617 constant buffers a frame copied as before). DoubleGhosty developed and checked the ports in Series X mode, where Victory gives the title another memory layout (`console.rs` `title_memory`). Measured anyway (standing / spinning, A → B): median 18.5 → 20.8 and 16.4 → 17.1 frames/s, preparing 40.6 → 36.7 and 47.8 → 42.7 ms, title copies 21.4 → 16.7 and 23.4 → 18.5 ms. With the ports inactive, these differences are run-to-run variation, which is about ±5 ms of copies between runs on one build. Decisions need several runs per side or a direct counter of the targeted cost. Next options: try the ports in Series X mode, or the descriptor cache (stage 1).
