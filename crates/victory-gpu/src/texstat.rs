@@ -62,6 +62,20 @@ pub(crate) enum T {
     Rep2To3Bytes,
     Rep4To9Bytes,
     Rep10Bytes,
+    /// Guarded textures read to be hashed, by why (bytes): the guard saw a
+    /// write (or it was the first asking), the eighth-frame turn, the
+    /// texture is hot (new, or changed unseen lately), a bake's exact read;
+    /// and of all of them, those whose staging buffer had never been hashed.
+    GuardWhyWritten,
+    GuardWhyTurn,
+    GuardWhyHot,
+    GuardWhyExact,
+    GuardFresh,
+    /// Refreshes that found the memory changed against the staging buffer
+    /// and detiled it, while it hashes the same as what the host copy holds
+    /// (the last upload's): read, detiled and uploaded for nothing.
+    SameAsCardN,
+    SameAsCardBytes,
     Len,
 }
 
@@ -132,7 +146,9 @@ pub(crate) fn log(frames: f64) {
          uploads by reason: first {:.1}x {:.1} MB, changed {:.1}x {:.1} MB, levels judged anew {:.1}x {:.1} MB, \
          level asked again {:.1}x {:.1} MB, bake {:.1}x {:.1} MB, new staging for an uploaded texture {:.1}x {:.1} MB. \
          upload MB by the texture's upload count: 1st {:.1}, 2nd-3rd {:.1}, 4th-9th {:.1}, 10th+ {:.1}; \
-         {} textures uploaded since the start",
+         {} textures uploaded since the start. guarded MB hashed because: written {:.1}, turn {:.1}, hot {:.1}, \
+         exact {:.1} ({:.1} MB of never-hashed staging buffers). detiled although the same as the host copy holds: \
+         {:.1}x {:.1} MB",
         n(T::WatchedN),
         mb(T::WatchedRead),
         mb(T::WatchedWritten),
@@ -163,6 +179,13 @@ pub(crate) fn log(frames: f64) {
         mb(T::Rep4To9Bytes),
         mb(T::Rep10Bytes),
         textures,
+        mb(T::GuardWhyWritten),
+        mb(T::GuardWhyTurn),
+        mb(T::GuardWhyHot),
+        mb(T::GuardWhyExact),
+        mb(T::GuardFresh),
+        n(T::SameAsCardN),
+        mb(T::SameAsCardBytes),
     );
 }
 

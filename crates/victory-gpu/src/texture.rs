@@ -1303,6 +1303,18 @@ impl Staging {
         *self.holds.lock().unwrap_or_else(|e| e.into_inner()) = hash.map(|hash| (self.first, hash));
     }
 
+    /// For `crate::texstat`: a refresh found `hash`, which differs from the
+    /// staging buffer's last, and is about to detile; counted when it is
+    /// what the host copy holds already. (Taken with `last` held, the order
+    /// `note_held` takes the two in.)
+    #[cfg(feature = "diagnostics")]
+    fn note_same_as_card(&self, hash: Digest, size: usize) {
+        if *self.holds.lock().unwrap_or_else(|e| e.into_inner()) == Some((self.first, hash)) {
+            crate::texstat::add(crate::texstat::T::SameAsCardN, 1);
+            crate::texstat::add(crate::texstat::T::SameAsCardBytes, size as u64);
+        }
+    }
+
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
@@ -1411,6 +1423,22 @@ impl Staging {
             #[cfg(feature = "diagnostics")]
             {
                 guarded = true;
+                use crate::texstat::{T, add};
+                // The first reason that applies, in the order the test above
+                // lets a refresh through.
+                let why = if exact {
+                    T::GuardWhyExact
+                } else if !unwritten {
+                    T::GuardWhyWritten
+                } else if hot {
+                    T::GuardWhyHot
+                } else {
+                    T::GuardWhyTurn
+                };
+                add(why, size as u64);
+                if last.hash.is_none() {
+                    add(T::GuardFresh, size as u64);
+                }
             }
         }
         // Which path a hashed refresh took, for `crate::texstat`.
@@ -1480,6 +1508,8 @@ impl Staging {
                     crate::texstat::add(crate::texstat::T::PartialZero, 1);
                     return false;
                 }
+                #[cfg(feature = "diagnostics")]
+                self.note_same_as_card(hash, size);
                 self.detile(read);
                 true
             });
@@ -1512,6 +1542,8 @@ impl Staging {
                 }
                 last.hash = Some(hash);
                 found_blind(last);
+                #[cfg(feature = "diagnostics")]
+                self.note_same_as_card(hash, size);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -1534,6 +1566,8 @@ impl Staging {
         }
         last.hash = Some(hash);
         found_blind(last);
+        #[cfg(feature = "diagnostics")]
+        self.note_same_as_card(hash, size);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         {
