@@ -2,6 +2,15 @@
 
 ## 2026-11-27
 
+- **Ownerless-view cap `VICTORY_OWNERLESS_VIEWS` (commit `4f4296e`, ported from trustno1 `89fd9361`, 0 = keep all unless set): safety pass OK.**
+  - Pass `VIctory-bench/runs/ownerless-safety-20261127-222654`, diagnostics build, `PLACED_FIELDS=1` + `OWNERLESS_VIEWS=2000`.
+  - No crash and no error lines; median 26.9 frames/s (diag); the player called it "smooth AF". Shapes reached 885,812.
+  - The cap was not exercised: ownerless entries were 1 constant / 0 placed. They pile up only once the shapes are full (~40 min of play), so the real check is a 45–60 min open-world session.
+  - Diagnostics test `timeline::report::tests::real_waits_are_recorded_with_who_ended_them` now fails on its stack-name assertion (line 950) with this change; it passes without it. Its timing checks pass, so this is inlining in the diag profile, not logic.
+  - Release suite 346 passed (two known failures).
+  - The memory line also shows ~4,483 MB of host copies of placed textures whose title memory is no longer mapped. That is the next memory candidate.
+  - **Handover:** the player continues with Codex. Claude reviews Codex's work in the next session.
+
 - **Audit of the VIctory-7900XTX merge (`e05d463`, read-only): nothing vendor-specific to replace.**
   - It is one commit: 13 files, +974/−129.
   - No added line names AMD, Radeon, RDNA, 7900, NVIDIA or a vendor id (0x1002 / 0x10DE).
