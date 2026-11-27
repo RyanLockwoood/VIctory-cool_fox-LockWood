@@ -2,6 +2,13 @@
 
 ## 2026-11-27
 
+- **Marvisak/VIctory and its five most-starred forks reviewed (read-only).**
+  - Main repo: last push 2026-11-25. Correctness fixes for shaders and the GPU, some not in our tree (e.g. "the depth bounds test reaches the host"). Picture work, for the visuals phase.
+  - `DexNom/VIctory` (1,308 ★): "RayTime", aimed at AMD, FSR and ray tracing. Not for us.
+  - **`JMAN730/project-flamingo` PR #802 `VICTORY_LAZY_BACK=1`**: demand-paged GPU-to-title readback, where pages are made no-access and fetched on a CPU touch. This is the "copy back only when read" idea of the second report. It is +11,784 lines and stacked on PR #800, so it is too big for a small step. Kept as the reference implementation for later.
+  - `101Leafy/victory-leafy` (overlay, input, tests), `PastiiJay/klbf-lab-beta` (archived AMD lab) and `cat4blep/VIctory` (capture and debug tools): nothing for performance.
+  - Conclusion: the plan stays as it is (`VICTORY_LEVELS_ON_DEMAND` A/B first).
+
 - **Two forks reviewed (read-only, GitHub API; nothing fetched into the repo).**
   - **`Op-lite/victory-scarlett`** (branch `scarlett-fox`, based on our base `f4b48ad7`). Its README reports:
     - **`VICTORY_LEVELS_ON_DEMAND=0` as "the largest single gain".** The cool_fox launcher (ours) sets 1, which keeps every texture's whole chain on the card. Off: re-uploads 6.4 GB → under 15 MB, ~4 GB less commit, fewer freezes. This is a setting in our build too, and it matches our counter finding of whole textures uploaded again.
