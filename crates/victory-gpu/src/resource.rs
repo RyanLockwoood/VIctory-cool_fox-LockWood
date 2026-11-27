@@ -2258,18 +2258,14 @@ pub(crate) fn targets_census() -> [u64; 12] {
 /// of all 16,000 takes too long.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn census() -> ([u64; 10], Option<UnmappedCensus>) {
-    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    use std::sync::atomic::Ordering::Relaxed;
 
     const EVERY: u64 = 16;
     static CHECK_BACKING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let check_backing = *CHECK_BACKING.get_or_init(|| {
         std::env::var_os("VICTORY_TEXTURE_UNMAPPED_CENSUS").is_some_and(|v| v == "1")
     });
-    const QUERY_LIMIT: usize = 16;
-    static NEXT_BACKING: AtomicUsize = AtomicUsize::new(0);
-    let from = if check_backing { NEXT_BACKING.load(Relaxed) } else { 0 };
-    let mut next = from;
-    let mut queries = if check_backing { QUERY_LIMIT } else { 0 };
+    const SNAPSHOT_LIMIT: usize = 4096;
     let mut unmapped = UnmappedCensus::default();
     let mut count = [0u64; 10];
     let mut placed_filled = 0u64;
@@ -2308,13 +2304,8 @@ pub(crate) fn census() -> ([u64; 10], Option<UnmappedCensus>) {
                         {
                             unmapped.candidates += 1;
                             unmapped.candidate_bytes += host.bytes;
-                            if at >= from && queries > 0 {
-                                next = at.saturating_add(1);
-                                unmapped.checked += 1;
-                                if crate::texture::unmapped_by_query(r.data(), len, &mut queries) {
-                                    unmapped.confirmed += 1;
-                                    unmapped.bytes += host.bytes;
-                                }
+                            if unmapped.ranges.len() < SNAPSHOT_LIMIT {
+                                unmapped.ranges.push((r.data() as usize, len, host.bytes));
                             }
                         }
                     }
@@ -2326,12 +2317,6 @@ pub(crate) fn census() -> ([u64; 10], Option<UnmappedCensus>) {
             }
         }
     }
-    unmapped.queries = QUERY_LIMIT - queries;
-    if check_backing {
-        // After reaching the end, the next census starts at the beginning.
-        unmapped.wrapped = queries > 0;
-        NEXT_BACKING.store(if unmapped.wrapped { 0 } else { next }, Relaxed);
-    }
     (count, check_backing.then_some(unmapped))
 }
 
@@ -2340,11 +2325,8 @@ pub(crate) fn census() -> ([u64; 10], Option<UnmappedCensus>) {
 pub(crate) struct UnmappedCensus {
     pub(crate) candidates: u64,
     pub(crate) candidate_bytes: u64,
-    pub(crate) checked: u64,
-    pub(crate) confirmed: u64,
-    pub(crate) bytes: u64,
-    pub(crate) queries: usize,
-    pub(crate) wrapped: bool,
+    /// Address range and host allocation bytes, without resource ownership.
+    pub(crate) ranges: Vec<(usize, usize, u64)>,
 }
 
 /// Host textures alive (the title's and the twins) and the bytes the host

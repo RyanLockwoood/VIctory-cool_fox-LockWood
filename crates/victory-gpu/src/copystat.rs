@@ -719,6 +719,56 @@ fn log_memory_map() {
 
 /// Logs where the memory is: the process and the PC, then what this crate
 /// holds by kind (alive now), then the host buffers made since the start.
+fn check_unmapped_snapshot(snapshot: crate::resource::UnmappedCensus) {
+    use std::sync::{OnceLock, mpsc};
+    use std::time::{Duration, Instant};
+
+    static WORKER: OnceLock<Option<mpsc::SyncSender<crate::resource::UnmappedCensus>>> = OnceLock::new();
+    let worker = WORKER.get_or_init(|| {
+        let (send, receive) = mpsc::sync_channel::<crate::resource::UnmappedCensus>(0);
+        std::thread::Builder::new().name("victory-unmapped-census".into()).spawn(move || {
+            const QUERY_LIMIT: usize = 4096;
+            const TIME_LIMIT: Duration = Duration::from_millis(250);
+            let mib = |bytes: u64| bytes as f64 / (1 << 20) as f64;
+            let mut next = 0;
+            while let Ok(snapshot) = receive.recv() {
+                let began = Instant::now();
+                let mut queries = QUERY_LIMIT;
+                let (mut checked, mut confirmed, mut bytes) = (0, 0, 0);
+                let ranges = &snapshot.ranges;
+                let start = next.min(ranges.len().saturating_sub(1));
+                for &(at, len, host_bytes) in ranges[start..].iter().chain(&ranges[..start]) {
+                    if queries == 0 || began.elapsed() >= TIME_LIMIT {
+                        break;
+                    }
+                    checked += 1;
+                    // The resource may have changed since it was sampled.
+                    // Only query address metadata. Never retain or read it.
+                    if crate::texture::unmapped_by_query(at as *const u8, len, &mut queries) {
+                        confirmed += 1;
+                        bytes += host_bytes;
+                    }
+                }
+                next = if checked < ranges.len() { (start + checked) % ranges.len() } else { 0 };
+                tracing::info!(
+                    candidates = snapshot.candidates,
+                    candidate_host_mib = mib(snapshot.candidate_bytes),
+                    snapshot_ranges = ranges.len(), checked, confirmed,
+                    confirmed_host_mib = mib(bytes),
+                    region_queries = QUERY_LIMIT - queries,
+                    elapsed_ms = began.elapsed().as_millis(),
+                    "sampled idle placed texture copies with fully uncommitted backing"
+                );
+            }
+        }).ok()?;
+        Some(send)
+    });
+    if let Some(worker) = worker {
+        // Skip this sample if the worker is busy rather than queue stale ranges.
+        let _ = worker.try_send(snapshot);
+    }
+}
+
 fn log_memory() {
     use std::sync::atomic::Ordering::Relaxed;
     let mb = |v: u64| v as f64 / (1 << 20) as f64;
@@ -732,16 +782,7 @@ fn log_memory() {
     let stagings = crate::texture::let_go();
     let (census, unmapped) = crate::resource::census();
     if let Some(unmapped) = unmapped {
-        tracing::info!(
-            candidates = unmapped.candidates,
-            candidate_host_mib = mb(unmapped.candidate_bytes),
-            checked = unmapped.checked,
-            confirmed = unmapped.confirmed,
-            confirmed_host_mib = mb(unmapped.bytes),
-            region_queries = unmapped.queries,
-            wrapped = unmapped.wrapped,
-            "sampled idle placed texture copies with fully uncommitted backing"
-        );
+        check_unmapped_snapshot(unmapped);
     }
     let kinds: Vec<u64> = crate::resource::KINDS.iter().map(|k| k.load(Relaxed)).collect();
     let card = crate::host::host()
