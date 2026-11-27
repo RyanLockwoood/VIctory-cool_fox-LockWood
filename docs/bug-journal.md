@@ -2,6 +2,26 @@
 
 ## 2026-11-27
 
+- **Where the memory goes, with `VICTORY_LEVELS_ON_DEMAND=0` (now the bench scripts' standard).** Pass `VIctory-bench/runs/memmap-20261127-075127`, release `ports-only`. A new read-only tool `VIctory-bench/Memory-Map.ps1` (VirtualQueryEx walk; option `Bench-Loop.ps1 -MemoryMap`) ran 6.5 min into the cutscene.
+  - Windows private 33.2 GB, working set 22.0 GB.
+  - Committed: private 32.75 GB in 200,253 allocations, mapped 15.34 GB in 94,128, image 0.74 GB.
+  - Private by allocation size:
+    - **64–256 MB: 14.9 GB in 224**
+    - 1–16 MB: 6.4 GB in 1,180
+    - 16–64 MB: 5.5 GB in 184
+    - 256 MB–1 GB: 3.5 GB in 5
+    - ≥ 1 GB: 2.4 GB in 2 (title area, 0x900000000 and 0x948a00000)
+  - Mapped: the title's 3.88 GB pool appears twice, at `0x9b6000000` (24,583 regions) and as one view at `0x20236d80000`.
+  - **Over each pass, private memory follows the texture pool.** In lod-ab passes 2 and 4 and memmap pass 1, private grows 5.7 → 34 GB while `texture_pool_mib` grows 0.2 → 12.9 GB. It levels off and dips slightly at the end (34.4 → 33.9 GB), so there is no leak sign within one cutscene.
+  - **Reading.**
+    - The ~224 blocks of ~64 MB are the texture pool's heaps: card memory that Windows charges against commit.
+    - With `LEVELS_ON_DEMAND=0` the card sits at ~58% of its budget, below the 88% line of `host.rs` `vram_keep`, so idle textures are kept 10 minutes (`KEPT_MS`) and the pool only grows. **There is no pool cap in our build** (Op-lite has `VICTORY_POOL_CAP`); `VICTORY_TEXTURE_POOL=0` only turns the blocks off.
+    - The working set (~23 GB of RAM, 0.3 GB free) is a separate question: title memory and its views, ~6 GB of non-local card memory, and Victory's copies.
+  - **Next (with GO):**
+    - (a) a leak test: one pass held open ~15 min after the cutscene, standing still;
+    - (b) a small switch to cap what `vram_keep` keeps;
+    - (c) per-allocation working set (QueryWorkingSetEx) to attribute the RAM.
+
 - **`VICTORY_LEVELS_ON_DEMAND=0` wins clearly: half the stutter time, 11 GB less RAM, 12 GB less VRAM.**
   - Batch `VIctory-bench/runs/lod-ab-20261127-070703`: build `target/ports-only` (release, `6b24606`), Series S, standard settings. Four cutscene passes in alternating order: A = 1 (the launcher's default) / B = 0.
   - The batch's own PresentMon had died beside a left-over instance from the interrupted batch, so it was started by hand at 07:07:48, before pass 1's cutscene. The script now warns if PresentMon is not recording.
