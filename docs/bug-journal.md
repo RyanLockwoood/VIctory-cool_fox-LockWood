@@ -2,6 +2,24 @@
 
 ## 2026-11-27
 
+- **Texture counters (diagnostics only, commit `4e7b763`, branch `texture-counters`, backup tag `backup-20261127-before-counters`).**
+  - New module `texstat.rs`, logged per frame next to the copy statistics as "texture work per frame":
+    - Refreshes by how a change was found: watched write (with the bytes of the 64 KiB pages actually written, against the whole texture read and detiled again), partly mapped, guarded, other. Each with bytes read and bytes changed.
+    - Uploads by reason: first, changed, levels judged anew, level asked again, bake, new staging for an uploaded texture.
+    - Upload bytes by the texture's upload count (1st, 2nd–3rd, 4th–9th, 10th+).
+  - Built in `target/counters` (diag profile, launcher `target/counters/Play-VIctory.cmd`). Diagnostics suite 395 passed with the two known failures, including the new test `uploads_are_classed_by_count_and_reason`. The release check gives no new warnings.
+- **Second baseline with NVIDIA FrameView alongside PresentMon** (`VIctory-bench/runs/fv-base-20261127-055817`; FrameView 2.0, benchmark toggled with Scroll Lock by `Bench-Loop.ps1 -FrameView`, logs in `Documents/FrameView`, copied to the handoff folder).
+  - **The two tools agree** on frames, p50, p99 and max in every pass, to within 0.1 ms and one frame. FrameView adds per-frame GPU power and clocks and CPU load, power and temperature. Its "GPU util" of ~92% has the same flaw as PresentMon's GPUBusy.
+  - **Results over 375 s (passes 1 / 2 / 3, PresentMon):**
+    - avg 21.3 / 21.0 / 20.9 frames/s; p50 37.8 / 36.8 / 37.8 ms; p99 179 / 233 / 195 ms; max 1016 / 1152 / 3128 ms
+    - seconds lost above 50 ms: 61.4 / 70.1 / 69.6
+  - **Against the first baseline (means):** avg 21.1 vs 21.1, p50 37.5 vs 37.6, p99 202 vs 205, lost 67.0 vs 67.6 s. The benchmark reproduces between batches.
+  - **FrameView medians:** RTX 5090 ~110 W (of ~575 W), CPU 63–67% load at ~91 W. The card is far from busy.
+  - Background apps drew frames during passes 1–2 (Brave at up to 22 fps, the Claude app); pass 3 was cleanest. Future batches run with them idle.
+  - The game ignored the window close in every pass, even 6 s before the cutscene's end, so each pass was force-closed after 60 s.
+  - The player reported pass 2's cutscene ending ~341 s after the detected start, against ~394 s in the manual run; to be checked against the logs.
+  - **Decision:** PresentMon stays the recorder; FrameView is optional, for power and CPU data.
+
 - **What the cutscene stalls are (read-only, `runs/base-20261127-051611`, new tool `VIctory-bench/stall_timeline.py`).** PresentMon's seconds lost per 5 s were set next to every counter in Victory's log.
   - **Correlation with seconds lost, passes 1 / 2 / 3:**
     - texture refresh time ("texture refreshes per frame, all threads", the reading, hashing and detiling): **r = +0.78 / +0.84 / +0.81**
