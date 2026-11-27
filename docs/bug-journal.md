@@ -2,6 +2,25 @@
 
 ## 2026-11-27
 
+- **Texture counter results, two cutscene passes** (`VIctory-bench/runs/counters-20261127-063357`, build `target/counters` at `4e7b763`, no PresentMon; window 5–375 s after the detected start; report `texstat_report.py`). Passes 1 / 2 agree closely:
+  - **Uploads.** 196.2 / 193.5 GB in total.
+    - First uploads: 12.4 / 12.4 GB (6.3 / 6.4%).
+    - New staging buffer for a texture uploaded before: 123.3 / 123.9 GB (62.8 / 64.0%).
+    - One-shot bake: 60.3 / 57.1 GB (30.7 / 29.5%), 128,548 / 124,670 uploads.
+    - Contents changed: 0.2 GB. Levels judged anew and level asked again: 0.
+  - **By the texture's upload count:** 1st 6%, 2nd–3rd 16%, 4th–9th 33%, **10th and later 45%**. About 60,000 distinct textures.
+  - **Refreshes:**
+    - Partly mapped: 161,322 / 151,602, reading 123.4 / 116.6 GB, all "changed". These are fresh staging buffers with no hash yet, so they match the new-staging uploads.
+    - **Guarded: 247,884 / 234,549, hashing 150.8 / 144.5 GB, of which 1.1 / 1.2 GB (1%) changed.**
+    - Other: 35.5 / 34.1 GB.
+    - Watched writes: 0.8 GB, 95–97% of the read bytes on written pages.
+  - **Reading.**
+    - (1) Textures picked by index lose their staging buffer after each upload (`draw.rs` ~3099, `texture::unstage`). A texture that is still streaming (partly mapped) is staged, read whole, detiled and uploaded whole again each time more of it is mapped (`draw.rs` ~2815: `partly`, looked at again next frame), up to 10 times and more.
+    - (2) Bake uploads are a third of the volume; their path is not understood yet.
+    - (3) Hashing of guarded textures is ~99% wasted. It runs at submission (`Step::Texture` → `Staging::refresh`), on the submitting thread.
+  - Suspected link, not proven: each fresh staging buffer starts "hot" (`HOT_FRAMES = 64`) and is hashed at every check.
+  - **Next counters** (commit `6edd6a5`, tag `backup-20261127-before-counters2`): guarded hashing by reason (written / turn / hot / exact, and never-hashed staging buffers), and refreshes that detile what the host copy holds already. Diagnostics suite 395 passed (two known failures); release unchanged.
+
 - **Texture counters (diagnostics only, commit `4e7b763`, branch `texture-counters`, backup tag `backup-20261127-before-counters`).**
   - New module `texstat.rs`, logged per frame next to the copy statistics as "texture work per frame":
     - Refreshes by how a change was found: watched write (with the bytes of the 64 KiB pages actually written, against the whole texture read and detiled again), partly mapped, guarded, other. Each with bytes read and bytes changed.
