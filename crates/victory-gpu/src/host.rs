@@ -569,8 +569,53 @@ fn bury(finished: u64) {
         }
         retired.drain(..n).collect()
     };
+    if let Some(undertaker) = undertaker() {
+        // Thousands of releases at once (341,643 pending in the busy-play run
+        // of 2026-11-28) would otherwise run here, on the thread that lands
+        // or submits the title's work, and hold up the next frame.
+        BURY_HANDOFFS[0].fetch_add(1, Ordering::Relaxed);
+        BURY_HANDOFFS[1].fetch_add(done.len() as u64, Ordering::Relaxed);
+        BURY_HANDOFFS[2].fetch_max(done.len() as u64, Ordering::Relaxed);
+        if let Err(back) = undertaker.send(done) {
+            drop(back.0);
+        }
+        return;
+    }
     drop(done);
 }
+
+/// `VICTORY_BURY_THREAD=1`: what [`bury`] lets go is dropped by one
+/// background thread ("victory-undertaker") instead of the landing or
+/// submitting thread. Off by default. The objects live a little longer
+/// (until that thread reaches them); D3D12 objects are free-threaded and
+/// [`Retired`] is already dropped on whichever thread finishes a submission.
+fn undertaker() -> Option<&'static std::sync::mpsc::Sender<Vec<Retirement>>> {
+    static TX: OnceLock<Option<std::sync::mpsc::Sender<Vec<Retirement>>>> = OnceLock::new();
+    TX.get_or_init(|| {
+        if std::env::var("VICTORY_BURY_THREAD").as_deref() != Ok("1") {
+            return None;
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<Retirement>>();
+        match std::thread::Builder::new().name("victory-undertaker".into()).spawn(move || {
+            for batch in rx {
+                drop(batch);
+            }
+        }) {
+            Ok(_) => {
+                tracing::info!("VICTORY_BURY_THREAD=1: retired objects are dropped on a background thread");
+                Some(tx)
+            }
+            Err(e) => {
+                tracing::warn!("VICTORY_BURY_THREAD=1, but the thread did not start ({e}); dropping in place");
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+/// Batches handed to the undertaker, objects in them, and the largest batch.
+pub(crate) static BURY_HANDOFFS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Objects [`retire`] dropped at once (no submission was running) and
 /// kept until a running submission finished, since the start.
