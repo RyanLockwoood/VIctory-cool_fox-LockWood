@@ -6134,3 +6134,53 @@ mod bake_flip_tests {
         assert!(take_pending_list_flip(id2).is_none(), "dropping uncalled closure cleans up entry");
     }
 }
+
+#[cfg(test)]
+mod view_limit_probe_tests {
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    /// The largest shader-visible view heap this host's card accepts, found
+    /// by halving between [`super::PORTABLE_VIEWS`] and 2^22 (measurement only:
+    /// `cargo test ... largest_view_heap -- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn largest_view_heap_the_host_accepts() {
+        let Some(host) = crate::host::host() else { return };
+        let fits = |count: u32| {
+            // SAFETY: plain heap creation; the heap is released at once.
+            let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
+                host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: count,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+            };
+            made.is_ok()
+        };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        // SAFETY: a struct of the size passed.
+        let _ = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS,
+                &mut options as *mut _ as *mut _,
+                std::mem::size_of_val(&options) as u32,
+            )
+        };
+        let (mut ok, mut bad) = (super::PORTABLE_VIEWS, 1u32 << 22);
+        assert!(fits(ok), "the portable size fits");
+        if fits(bad) {
+            ok = bad;
+        }
+        while bad - ok > 1024 {
+            let mid = ok + (bad - ok) / 2;
+            if fits(mid) { ok = mid } else { bad = mid }
+        }
+        println!(
+            "binding tier {:?}; largest view heap accepted about {ok} (refused {bad}); 1,245,184 fits: {}, 1,507,328 fits: {}",
+            options.ResourceBindingTier,
+            fits(1_245_184),
+            fits(1_507_328)
+        );
+    }
+}
