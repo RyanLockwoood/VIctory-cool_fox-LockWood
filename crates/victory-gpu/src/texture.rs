@@ -117,6 +117,32 @@ struct Last {
     /// first checks, and after the hash found a change the guard had not
     /// seen ([`hot_textures`]). 0: not checked under the guard yet.
     hot_until: u64,
+    /// With [`quiet_turns`]: how many turns in a row (up to
+    /// [`QUIET_MOST`]) the turn's hash found no change; each one doubles
+    /// the frames to this texture's next turn.
+    quiet: u8,
+}
+
+/// Most doublings of a quiet texture's turn: 8 frames become at most 256.
+const QUIET_MOST: u8 = 5;
+
+/// Whether a guarded texture whose turn's hash keeps finding no change is
+/// hashed ever more rarely, every 8, 16, 32 ... up to 256 frames, and every
+/// 8 again from the first change found (`VICTORY_TEXTURE_QUIET_TURNS=1`,
+/// off). The turn hashed ~140 GB in the 370 s opening cutscene and found
+/// ~1 % changed (counters2 run, 2026-11-27); in the open world 21 MB a
+/// frame were hashed with none changed (lockwood-restored-save). After
+/// Marvisak/VIctory 4959d34 and c6e9500: textures that are not changing
+/// are not looked at every time.
+fn quiet_turns() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TEXTURE_QUIET_TURNS").as_deref() == Ok("1"))
+}
+
+/// Every how many frames a texture's turn comes, `quiet` turns after the
+/// last change found.
+fn turn_every(every: u64, quiet: u8) -> u64 {
+    every << quiet.min(QUIET_MOST)
 }
 
 /// Frames a guarded texture is hashed at every check from its first check,
@@ -155,6 +181,14 @@ fn hash_every_from(setting: Option<&str>) -> u64 {
 
 #[cfg(test)]
 mod hash_every_tests {
+    #[test]
+    fn quiet_turns_double_up_to_256_frames() {
+        assert_eq!(super::turn_every(8, 0), 8);
+        assert_eq!(super::turn_every(8, 1), 16);
+        assert_eq!(super::turn_every(8, 5), 256);
+        assert_eq!(super::turn_every(8, 9), 256);
+    }
+
     #[test]
     fn the_turn_is_eight_unless_a_power_of_two_up_to_256_is_set() {
         use super::hash_every_from as f;
@@ -1485,7 +1519,7 @@ impl Staging {
             let frame = crate::frame::current();
             let turn = frame
                 .wrapping_add((start >> 16) as u64)
-                .is_multiple_of(hash_every());
+                .is_multiple_of(turn_every(hash_every(), if quiet_turns() { last.quiet } else { 0 }));
             // A texture starts hot: one written that way from its first
             // frames on changes before the hash has ever caught it.
             if last.hot_until == 0 {
@@ -1496,6 +1530,11 @@ impl Staging {
                 return 0;
             }
             blind = unwritten;
+            // A turn alone let this through: one more quiet turn, undone
+            // below if the hash finds a change.
+            if quiet_turns() && !exact && unwritten && !hot {
+                last.quiet = last.quiet.saturating_add(1).min(QUIET_MOST);
+            }
             #[cfg(feature = "diagnostics")]
             {
                 guarded = true;
@@ -1534,6 +1573,9 @@ impl Staging {
         };
         // A change the guard did not see: hashed at every check for a while.
         let found_blind = |last: &mut Last| {
+            if blind {
+                last.quiet = 0;
+            }
             if blind && hot_textures() {
                 last.hot_until = crate::frame::current() + HOT_FRAMES;
                 #[cfg(feature = "diagnostics")]
