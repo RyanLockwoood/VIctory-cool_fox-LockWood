@@ -166,11 +166,14 @@ const SHORTEST: u64 = 5;
 /// The stack of a wait or a list call this long is kept (microseconds).
 const DEEP: u64 = 50;
 
-/// A span of ours: from where it is made until it is dropped.
+/// A span of ours: from where it is made until it is dropped (and, with
+/// `VICTORY_PIX` and a PIX capture listening, a CPU event on its timeline).
 pub struct Span {
     name: &'static str,
     /// When it began (0: nothing is recorded).
     began: u64,
+    /// A PIX event was begun for it ([`crate::pix::begin_event`]).
+    pix: bool,
 }
 
 /// A span named `name`.
@@ -179,6 +182,7 @@ pub fn span(name: &'static str) -> Span {
     Span {
         name,
         began: if on() { ticks() } else { 0 },
+        pix: crate::pix::begin_event(name),
     }
 }
 
@@ -187,7 +191,11 @@ impl Span {
     #[inline(always)]
     pub fn next(&mut self, name: &'static str) {
         self.close();
+        if self.pix {
+            crate::pix::end_event();
+        }
         (self.name, self.began) = (name, if on() { ticks() } else { 0 });
+        self.pix = crate::pix::begin_event(name);
     }
 
     /// The span ends here.
@@ -210,6 +218,9 @@ impl Drop for Span {
     fn drop(&mut self) {
         if self.began != 0 {
             self.close();
+        }
+        if self.pix {
+            crate::pix::end_event();
         }
     }
 }

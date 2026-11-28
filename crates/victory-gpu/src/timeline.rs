@@ -34,24 +34,57 @@ pub use record::{Span, span};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) use record::{called, card_wait, on, polled, presented, sent, ticks, title_thread, told};
 
-/// A span of ours: from where it is made until it is dropped.
+/// A span of ours: from where it is made until it is dropped. Without
+/// diagnostics nothing is recorded here, but with `VICTORY_PIX` and a PIX
+/// capture listening it is a CPU event on PIX's timeline
+/// ([`crate::pix::begin_event`]).
 #[cfg(not(all(windows, feature = "diagnostics")))]
-pub struct Span;
+pub struct Span {
+    /// A PIX event was begun for it.
+    pix: bool,
+}
 
 #[cfg(not(all(windows, feature = "diagnostics")))]
 impl Span {
     /// The span ends here and another begins.
     #[inline(always)]
-    pub fn next(&mut self, _name: &'static str) {}
+    pub fn next(&mut self, name: &'static str) {
+        #[cfg(windows)]
+        {
+            if self.pix {
+                crate::pix::end_event();
+            }
+            self.pix = crate::pix::begin_event(name);
+        }
+        #[cfg(not(windows))]
+        let _ = name;
+    }
 
     /// The span ends here.
     #[inline(always)]
     pub fn end(self) {}
 }
 
+#[cfg(not(all(windows, feature = "diagnostics")))]
+impl Drop for Span {
+    #[inline(always)]
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if self.pix {
+            crate::pix::end_event();
+        }
+    }
+}
+
 /// A span named `name`.
 #[cfg(not(all(windows, feature = "diagnostics")))]
 #[inline(always)]
-pub fn span(_name: &'static str) -> Span {
-    Span
+pub fn span(name: &'static str) -> Span {
+    #[cfg(windows)]
+    return Span { pix: crate::pix::begin_event(name) };
+    #[cfg(not(windows))]
+    {
+        let _ = name;
+        Span { pix: false }
+    }
 }

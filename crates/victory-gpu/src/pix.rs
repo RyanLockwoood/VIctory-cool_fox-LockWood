@@ -22,6 +22,137 @@ struct Pix {
     allocated: Option<MemoryEvent>,
     freed: Option<MemoryEvent>,
     woke: Option<Woke>,
+    thread_info: Option<GetThreadInfo>,
+    replace_block: Option<ReplaceBlock>,
+}
+
+/// PIXEventsCommon.h `PIXEventsThreadInfo`: where this thread's CPU events
+/// go (`biased_limit` null: no capture is listening).
+#[repr(C)]
+struct ThreadInfo {
+    block: *mut core::ffi::c_void,
+    biased_limit: *mut u64,
+    destination: *mut u64,
+}
+/// `PIXEventsThreadInfo* WINAPI PIXGetThreadInfo()` and
+/// `UINT64 WINAPI PIXEventsReplaceBlock(PIXEventsThreadInfo*, bool getEarliestTime)`.
+type GetThreadInfo = unsafe extern "system" fn() -> *mut ThreadInfo;
+type ReplaceBlock = unsafe extern "system" fn(info: *mut ThreadInfo, earliest: bool) -> u64;
+
+// PIXEventsCommon.h, the V2 events.
+const EVENT_END: u64 = 0x00;
+const EVENT_BEGIN: u64 = 0x01;
+const METADATA_HAS_COLOR: u64 = 0xF0;
+const METADATA_STRING_IS_ANSI: u64 = 0x2;
+const SAFE_FAST_COPY_QWORDS: usize = 64 - 2;
+const BLOCK_END_MARKER: u64 = 0x0000_0000_000F_FF80;
+const SIZE_MAX: u64 = 127;
+
+/// `PIXEncodeEventInfo`.
+fn event_info(time: u64, kind: u64, size: u64, metadata: u64) -> u64 {
+    ((time & 0x0000_0FFF_FFFF_FFFF) << 20) | ((kind & 0x1F) << 7) | ((metadata & 0xFF) << 12) | (size & 0x7F)
+}
+
+/// A name as `PIXCopyStringArgument` copies an ANSI format string: eight
+/// bytes a word, little end first, the last word padded with zeros, and a
+/// zero word after it if the name filled its last word.
+fn name_words(name: &str, mut put: impl FnMut(u64) -> bool) {
+    let bytes = name.as_bytes();
+    for chunk in bytes.chunks(8) {
+        let mut word = [0u8; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        if !put(u64::from_le_bytes(word)) {
+            return;
+        }
+    }
+    if bytes.len() % 8 == 0 {
+        put(0);
+    }
+}
+
+/// A colour of its own for each name (`0xFFRRGGBB`), so that spans differ.
+fn color(name: &str) -> u64 {
+    let hash = name.bytes().fold(0x811c_9dc5_u32, |h, b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
+    0xFF00_0000 | u64::from(hash & 0x00FF_FFFF) | 0x0040_4040
+}
+
+fn now() -> u64 {
+    let mut t = 0i64;
+    // SAFETY: room for the counter.
+    unsafe { windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut t) };
+    t as u64
+}
+
+/// The thread's event buffer if a capture is listening, with the time and
+/// the room to write (as `PIXBeginEvent` / `PIXEndEvent` find them,
+/// replacing a full block).
+fn room(earliest: bool) -> Option<(&'static mut ThreadInfo, u64, *mut u64)> {
+    let p = pix()?;
+    let (get, replace) = (p.thread_info?, p.replace_block?);
+    // SAFETY: the export's signature; it returns this thread's own record.
+    let info = unsafe { get().as_mut()? };
+    if info.biased_limit.is_null() {
+        return None;
+    }
+    let time = if info.destination < info.biased_limit {
+        now()
+    } else {
+        // SAFETY: the export's signature, with the thread's own record.
+        let time = unsafe { replace(info, earliest) };
+        if time == 0 || info.destination >= info.biased_limit {
+            return None;
+        }
+        time
+    };
+    // SAFETY: the block has this much room past its biased limit (the
+    // header's own arithmetic).
+    let limit = unsafe { info.biased_limit.add(SAFE_FAST_COPY_QWORDS) };
+    Some((info, time, limit))
+}
+
+/// A CPU event begins on this thread, named `name` (with `VICTORY_PIX`, and
+/// only while a PIX capture is listening). Whether it was written: only
+/// then is [`end_event`] due.
+pub(crate) fn begin_event(name: &str) -> bool {
+    let Some((info, time, limit)) = room(false) else {
+        return false;
+    };
+    let start = info.destination;
+    // SAFETY: within the block: `limit` bounds every word but the end
+    // marker, for which the header keeps two words of tail room.
+    unsafe {
+        let event = start;
+        let mut at = start.add(1);
+        *at = color(name);
+        at = at.add(1);
+        name_words(name, |word| {
+            if at >= limit {
+                return false;
+            }
+            *at = word;
+            at = at.add(1);
+            true
+        });
+        *at = BLOCK_END_MARKER;
+        let size = (at.offset_from(start) as u64).min(SIZE_MAX);
+        *event = event_info(time, EVENT_BEGIN, size, METADATA_HAS_COLOR | METADATA_STRING_IS_ANSI);
+        info.destination = at;
+    }
+    true
+}
+
+/// The event [`begin_event`] began on this thread ends.
+pub(crate) fn end_event() {
+    let Some((info, time, _)) = room(true) else {
+        return;
+    };
+    // SAFETY: room for the event and the end marker (the tail words).
+    unsafe {
+        let at = info.destination;
+        *at = event_info(time, EVENT_END, 1, 0);
+        *at.add(1) = BLOCK_END_MARKER;
+        info.destination = at.add(1);
+    }
 }
 
 /// pix3_win.h: `void WINAPI PIXNotifyWakeFromFenceSignal(HANDLE event)`.
@@ -119,6 +250,11 @@ fn load() -> Option<Pix> {
         // documented signature (pix3_win.h).
         woke: unsafe { GetProcAddress(module, c"PIXNotifyWakeFromFenceSignal".as_ptr().cast()) }
             .map(|f| unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, Woke>(f) }),
+        // SAFETY: as above (PIXEventsCommon.h, pix3_win.h).
+        thread_info: unsafe { GetProcAddress(module, c"PIXGetThreadInfo".as_ptr().cast()) }
+            .map(|f| unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, GetThreadInfo>(f) }),
+        replace_block: unsafe { GetProcAddress(module, c"PIXEventsReplaceBlock".as_ptr().cast()) }
+            .map(|f| unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, ReplaceBlock>(f) }),
     })
 }
 
@@ -468,6 +604,42 @@ pub(crate) mod stutter {
 }
 
 #[cfg(test)]
+mod encoding_tests {
+    use super::*;
+
+    /// The words are the header's: `PIXEncodeEventInfo` and the ANSI
+    /// string copy of `PIXCopyEventStringArgumentSlow`.
+    #[test]
+    fn events_are_encoded_as_the_header_does() {
+        // Timestamp in bits 20..63, type in 7..11, metadata in 12..19, size in 0..6.
+        assert_eq!(event_info(1, EVENT_BEGIN, 3, 0xF2), (1 << 20) | (1 << 7) | (0xF2 << 12) | 3);
+        assert_eq!(event_info(5, EVENT_END, 1, 0), (5 << 20) | 1);
+        assert_eq!(event_info(u64::MAX, 0x1F, 0x7F, 0xFF), u64::MAX, "every field masked to its width");
+        let words = |name: &str| {
+            let mut out = Vec::new();
+            name_words(name, |w| {
+                out.push(w);
+                true
+            });
+            out
+        };
+        assert_eq!(words("abc"), vec![u64::from_le_bytes(*b"abc\0\0\0\0\0")]);
+        assert_eq!(words("abcdefgh"), vec![u64::from_le_bytes(*b"abcdefgh"), 0], "a full last word gets a zero word");
+        assert_eq!(words("submit: sending"), vec![u64::from_le_bytes(*b"submit: "), u64::from_le_bytes(*b"sending\0")]);
+        assert_eq!(words(""), vec![0]);
+        // The copy stops where the block does.
+        let mut n = 0;
+        name_words("a long name of three words", |_| {
+            n += 1;
+            n < 2
+        });
+        assert_eq!(n, 2);
+        assert_eq!(color("x") >> 24, 0xFF, "opaque");
+        assert_ne!(color("submit: sending"), color("closing a host list"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     /// A capture begins at once, counts a slow frame only once it is warm,
     /// ends two seconds after it, and no more begin than allowed.
@@ -545,6 +717,11 @@ mod tests {
         counter(name!("Victory: test counter"), 1.5);
         assert!(pix().is_some_and(|p| p.allocated.is_some() && p.freed.is_some()), "the memory event exports are found");
         assert!(pix().is_some_and(|p| p.woke.is_some()), "the fence wake export is found");
+        assert!(pix().is_some_and(|p| p.thread_info.is_some() && p.replace_block.is_some()), "the CPU event exports are found");
+        // No capture listens in a test: nothing is written, nothing breaks.
+        if begin_event("Victory: test span") {
+            end_event();
+        }
         // SAFETY: a plain event of our own.
         let event = unsafe { windows::Win32::System::Threading::CreateEventW(None, false, true, None) }.unwrap();
         woke(event);
