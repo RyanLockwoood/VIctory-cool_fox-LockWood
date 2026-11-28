@@ -57,6 +57,8 @@ pub mod pipeline;
 #[cfg(windows)]
 mod picked;
 #[cfg(windows)]
+mod pix;
+#[cfg(windows)]
 mod pool;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod popwatch;

@@ -452,6 +452,7 @@ fn sweep() {
     #[cfg(feature = "diagnostics")]
     crate::book::check();
     crate::residency::refresh();
+    crate::pix::report_memory();
     if crate::residency::pressured() {
         trim_spare_chunks();
     }
