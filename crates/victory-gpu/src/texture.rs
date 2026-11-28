@@ -16,6 +16,8 @@
 //! (every mip and array slice), depth and stencil planes are not.
 
 pub(crate) mod ahead;
+#[allow(dead_code)] // Step 1: proven against the processor's detiler, not recorded yet.
+pub(crate) mod detile_gpu;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
