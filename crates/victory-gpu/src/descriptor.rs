@@ -1381,7 +1381,7 @@ pub(crate) extern "system" fn create_uav(
     record(handle, view);
 }
 
-/// Whether a placed view keeps only the fields of the resource description
+/// Whether a placed view keeps only the fields of the resource and view descriptions
 /// it is given (`VICTORY_PLACED_FIELDS=1`; off unless set). Words 1 and 13
 /// of the 56-byte description are padding (before the 8-byte alignment, and
 /// after the flags) that the title may leave unwritten: the same view came
@@ -1407,6 +1407,74 @@ fn placed_resource_words(desc: *const [u32; 14], fields_only: bool) -> Option<[u
     Some(words)
 }
 
+/// The words of a placed view's description with those its kind does not
+/// use set to zero, with [`placed_fields`]. The first ten words are the PC's
+/// view description: for a shader resource view, the format, the
+/// dimension, the component mapping, a word of padding (the union that
+/// follows starts on 8 bytes) and the union's six words; for an unordered
+/// access view, the format, the dimension and the union's eight words. Each
+/// dimension uses only the head of the union (D3D12_BUFFER_SRV,
+/// D3D12_TEX2D_SRV and the like), and the title leaves the rest unwritten:
+/// trustno1-coder/VIctory-NVIDIA 144aca0 saw 131,392 values in word 3 and
+/// 36,413 in word 9 of a million shapes, each a new shape for the same view
+/// (shapes still reached 1.75 million in Codex's open-world run A2 with the
+/// resource padding left out). Words 10 and on (the address and the
+/// console's own fields) are kept; an unknown dimension keeps every word.
+fn placed_view_words(desc: *const [u32; 16], unordered: bool, fields_only: bool) -> Option<[u32; 16]> {
+    let mut d = words(desc)?;
+    if !fields_only {
+        return Some(d);
+    }
+    let (start, used) = if unordered {
+        // D3D12_UAV_DIMENSION: unknown, buffer, 1D, 1D array, 2D, 2D array,
+        // 2D MS, 2D MS array, 3D.
+        const USED: [usize; 9] = [0, 7, 1, 3, 2, 4, 0, 2, 3];
+        (2, USED.get(d[1] as usize).copied())
+    } else {
+        // D3D12_SRV_DIMENSION: unknown, buffer, 1D, 1D array, 2D, 2D array,
+        // 2D MS, 2D MS array, 3D, cube, cube array, acceleration structure.
+        const USED: [usize; 12] = [0, 5, 3, 5, 4, 6, 0, 2, 3, 3, 5, 2];
+        (4, USED.get(d[1] as usize).copied())
+    };
+    if let Some(used) = used.filter(|_| d[1] != 0) {
+        if !unordered {
+            d[3] = 0;
+        }
+        d[start + used..10].fill(0);
+    }
+    Some(d)
+}
+
+#[cfg(test)]
+mod placed_view_words_tests {
+    use super::placed_view_words;
+
+    #[test]
+    fn unused_view_words_are_cleared_only_when_asked() {
+        // A structured buffer SRV: words 4-5 first element, 6 count, 7
+        // stride, 8 flags; 3 (padding) and 9 (union tail) unused.
+        let srv = [0, 1, 0x1688, 0xdead, 16, 0, 64, 16, 0, 0xbeef, 0x1000, 0x6, 0, 0, 0, 0];
+        let mut want = srv;
+        (want[3], want[9]) = (0, 0);
+        assert_eq!(placed_view_words(&srv, false, true), Some(want));
+        assert_eq!(placed_view_words(&srv, false, false), Some(srv));
+        // A buffer UAV uses words 2-8; 9 goes.
+        let uav = [0, 1, 16, 0, 64, 16, 0, 0, 0, 0xbeef, 0x1000, 0x6, 0, 0, 0, 0];
+        let mut want = uav;
+        want[9] = 0;
+        assert_eq!(placed_view_words(&uav, true, true), Some(want));
+        // A 2D texture SRV uses four words of the union (4-7): 3, 8 and 9 go.
+        let tex = [28, 4, 0x1688, 0x77, 0, 1, 0, 0, 0x55, 0x66, 0x2000, 0x6, 0, 0, 0, 0];
+        let mut want = tex;
+        (want[3], want[8], want[9]) = (0, 0, 0);
+        assert_eq!(placed_view_words(&tex, false, true), Some(want));
+        // An unknown dimension keeps every word; words 10 and on are always kept.
+        let odd = [7, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+        assert_eq!(placed_view_words(&odd, false, true), Some(odd));
+        assert_eq!(placed_view_words(std::ptr::null(), false, true), None);
+    }
+}
+
 /// Device methods 0x230 and 0x238: shader resource and unordered access
 /// views of memory the title placed itself, `(resource desc, view desc,
 /// handle)`.
@@ -1416,7 +1484,7 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (placed_resource_words(resource, placed_fields()), words(desc)) {
+    if let (Some(resource), Some(desc)) = (placed_resource_words(resource, placed_fields()), placed_view_words(desc, false, placed_fields())) {
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -1427,7 +1495,7 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (placed_resource_words(resource, placed_fields()), words(desc)) {
+    if let (Some(resource), Some(desc)) = (placed_resource_words(resource, placed_fields()), placed_view_words(desc, true, placed_fields())) {
         record(handle, View::Placed(true, resource, desc));
     }
 }
