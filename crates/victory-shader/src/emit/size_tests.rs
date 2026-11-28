@@ -268,6 +268,49 @@ fn a_counter_texture_is_set_by_a_store_of_one_channel() {
     assert!(program([0xF020_1308, 0x0002_0300], 0x7E06_0289).is_err());
 }
 
+/// Image atomics on one 64-bit value (data masks 0x3 and 0xF, in an
+/// R32G32_UINT view): an add carries into the high dword, a compare-exchange
+/// matches all 64 bits and returns the old value, and that value feeds
+/// another add.
+#[test]
+fn image_atomics_on_64_bit_values() {
+    let words = [
+        0xF40C_0201u32, // s_load_dwordx8 s[8:15], s[2:3], 0
+        0xFA00_0000,
+        0x7E00_0280, // v_mov_b32 v0, 0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x7E04_02C1, // v_mov_b32 v2, -1
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0xF044_3308, // image_atomic_add v[2:3], v[0:1], s[8:15] dmask:0x3 2D glc
+        0x0002_0200,
+        0x7E08_0281, // v_mov_b32 v4, 1
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0xF044_3308, // image_atomic_add v[4:5], v[0:1], s[8:15] dmask:0x3 2D glc
+        0x0002_0400,
+        0x7E0C_0287, // v_mov_b32 v6, 7 (replacement, low)
+        0x7E0E_0280, // v_mov_b32 v7, 0
+        0x7E10_0280, // v_mov_b32 v8, 0 (comparand 1 << 32, low)
+        0x7E12_0281, // v_mov_b32 v9, 1
+        0xF040_3F08, // image_atomic_cmpswap v[6:9], v[0:1], s[8:15] dmask:0xf 2D glc
+        0x0002_0600,
+        0xF044_3308, // image_atomic_add v[6:7], v[0:1], s[8:15] dmask:0x3 2D glc
+        0x0002_0600,
+        0xBE84_0380, // s_mov_b32 s4, 0
+        0xBE85_0380, // s_mov_b32 s5, 0
+    ];
+    let shader = build(&[TABLE, &words, STORE].concat(), (8, 0)).expect("translates");
+    let texel = [[0.0; 4]; 1];
+    let views = [
+        View::Uint2TextureUav(1, 1),
+        View::Texture(1, 1, &texel),
+        View::RawUav(2),
+    ];
+    for (label, got) in run(&shader, &views) {
+        // 0xffff_ffff + 1 = 1 << 32, swapped for 7, plus the old 1 << 32.
+        assert_eq!(got, [7, 1], "{label}");
+    }
+}
+
 /// A load past the wave's cache (GLC) of a buffer other groups write: its
 /// view is globally coherent on the host, as is every access to it.
 #[test]
