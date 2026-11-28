@@ -12,9 +12,42 @@
 use std::sync::OnceLock;
 
 type ReportCounter = unsafe extern "system" fn(name: *const u16, value: f32);
+/// pix3_win.h: `void WINAPI PIXRecordMemoryAllocationEvent(USHORT
+/// allocatorId, void* baseAddress, size_t size, UINT64 metadata)`, and the
+/// free event with the same arguments.
+type MemoryEvent = unsafe extern "system" fn(allocator: u16, base: *const u8, size: usize, metadata: u64);
 
 struct Pix {
     report_counter: ReportCounter,
+    allocated: Option<MemoryEvent>,
+    freed: Option<MemoryEvent>,
+}
+
+/// Allocator ids in PIX's memory view: staging blocks of textures (64 MiB
+/// each, in the PC's memory) and host copies of title memory.
+pub(crate) const STAGING_BLOCKS: u16 = 1;
+pub(crate) const HOST_COPIES: u16 = 2;
+
+/// `size` bytes at `base` are the layer's, from now on, as `allocator`'s
+/// (with `VICTORY_PIX`): a PIX timing capture's memory view shows each with
+/// the call stack that made it.
+pub(crate) fn allocated(allocator: u16, base: *const u8, size: u64) {
+    if let Some(f) = pix().and_then(|p| p.allocated)
+        && !base.is_null()
+    {
+        // SAFETY: the export's signature; the address is only recorded.
+        unsafe { f(allocator, base, size as usize, 0) };
+    }
+}
+
+/// The matching free of [`allocated`].
+pub(crate) fn freed(allocator: u16, base: *const u8, size: u64) {
+    if let Some(f) = pix().and_then(|p| p.freed)
+        && !base.is_null()
+    {
+        // SAFETY: as above.
+        unsafe { f(allocator, base, size as usize, 0) };
+    }
 }
 
 fn pix() -> Option<&'static Pix> {
@@ -53,10 +86,20 @@ fn load() -> Option<Pix> {
         tracing::warn!(path = %path.display(), "VICTORY_PIX: the DLL has no PIXReportCounter; no PIX counters");
         return None;
     };
-    tracing::info!(path = %path.display(), "VICTORY_PIX: memory counters go to PIX timing captures once a second");
-    // SAFETY: the export's documented signature (pix3.h:
-    // `void WINAPI PIXReportCounter(PCWSTR name, float value)`).
-    Some(Pix { report_counter: unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, ReportCounter>(report) } })
+    tracing::info!(path = %path.display(), "VICTORY_PIX: memory counters and allocations go to PIX timing captures");
+    let event = |name: &std::ffi::CStr| {
+        // SAFETY: a loaded module and a NUL-terminated name; the exports'
+        // documented signature (pix3_win.h).
+        unsafe { GetProcAddress(module, name.as_ptr().cast()) }
+            .map(|f| unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, MemoryEvent>(f) })
+    };
+    Some(Pix {
+        // SAFETY: the export's documented signature (pix3.h:
+        // `void WINAPI PIXReportCounter(PCWSTR name, float value)`).
+        report_counter: unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, ReportCounter>(report) },
+        allocated: event(c"PIXRecordMemoryAllocationEvent"),
+        freed: event(c"PIXRecordMemoryFreeEvent"),
+    })
 }
 
 /// Whether counters go to PIX.
@@ -145,5 +188,10 @@ mod tests {
         assert!(on(), "WinPixEventRuntime.dll at {path:?} must load");
         report_memory();
         counter(name!("Victory: test counter"), 1.5);
+        assert!(pix().is_some_and(|p| p.allocated.is_some() && p.freed.is_some()), "the memory event exports are found");
+        let block = vec![0u8; 1 << 20];
+        allocated(STAGING_BLOCKS, block.as_ptr(), block.len() as u64);
+        freed(STAGING_BLOCKS, block.as_ptr(), block.len() as u64);
+        allocated(HOST_COPIES, std::ptr::null(), 0);
     }
 }

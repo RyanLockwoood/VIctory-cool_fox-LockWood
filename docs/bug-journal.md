@@ -2,6 +2,11 @@
 
 ## 2026-11-28
 
+- **PIX allocation tracking, the RAM step of the PIX work (with `VICTORY_PIX`).** `PIXRecordMemoryAllocationEvent`/`PIXRecordMemoryFreeEvent` (pix3_win.h) for two of the layer's large users of the PC's memory, so a PIX timing capture's memory view shows them, with the call stacks that made them, beside the counters:
+  - allocator 1, **staging blocks of textures** (64 MiB each, `pool::staging`): reported at creation; freed through a shared guard in `Upload` when its last clone goes, the block's release in `reclaim`.
+  - allocator 2, **host copies of title memory** (`Shadow::new`/`Drop`): copies placed in title memory itself (`Shadow::placed`) are reported freed at once, since they are no memory of ours. `Shadow` has one constructor, and `data`/`len` never change, so every allocation has its matching free.
+  - Off (no DLL loaded): one check per call. Test with the real DLL: both exports found, events taken. Suite 407 passed. Not run in game by Claude.
+
 - **Detiling on the card, step 3: wired in behind `VICTORY_GPU_DETILE=1` (off by default).** Backup tag `backup-before-gpu-detile-wiring-20261128`.
   - **Which textures:** at staging creation, a texture gets `Staging::gpu` (one `DetilePlan` per part) when the switch is on, it is not levels on demand, and every staged part has 4-, 8- or 16-byte elements in an addressable mode with addresses within 32 bits. Movie planes (R8) never qualify. Every other texture is unchanged.
   - **Refresh:** for such a texture `Staging::detile` copies the tiled bytes as they are into staging (`read` bytes, `VICTORY_DETILE_TIMING` counts it). Staging is sized `max(rows, read)`. The dirty/uploaded flow is untouched.

@@ -344,11 +344,28 @@ impl<B: Clone> Pool<B> {
     }
 }
 
-/// A mapped upload buffer's memory.
+/// A mapped upload buffer's memory, and (with `VICTORY_PIX`) the note to
+/// PIX that it is let go, sent when the last clone goes.
 #[derive(Clone)]
-struct Upload(ID3D12Resource, *mut u8);
+struct Upload(ID3D12Resource, *mut u8, #[allow(dead_code)] std::sync::Arc<PixBlock>); // (held for its drop)
 // SAFETY: the mapping is written by the owners of its pieces, each its own.
 unsafe impl Send for Upload {}
+
+/// A staging block as PIX was told of it ([`crate::pix::allocated`]).
+struct PixBlock(usize);
+
+impl PixBlock {
+    fn new(data: *mut u8) -> Self {
+        crate::pix::allocated(crate::pix::STAGING_BLOCKS, data, BLOCK);
+        Self(data as usize)
+    }
+}
+
+impl Drop for PixBlock {
+    fn drop(&mut self) {
+        crate::pix::freed(crate::pix::STAGING_BLOCKS, self.0 as *const u8, BLOCK);
+    }
+}
 
 static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
 static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
@@ -421,7 +438,7 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         let _caller_timer = crate::texture::staging_allocation_timer(&crate::texture::STAGING_POOL_ALLOCATIONS_US);
         let (buffer, data) = host.upload_buffer(BLOCK)?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
-        Some(Upload(buffer, data))
+        Some(Upload(buffer, data, std::sync::Arc::new(PixBlock::new(data))))
     });
     drop(pool);
     let (piece, memory, again) = allocation?;
