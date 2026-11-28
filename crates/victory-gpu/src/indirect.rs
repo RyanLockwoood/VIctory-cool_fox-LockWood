@@ -2664,8 +2664,16 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
     /// lives (the card's copy is zeroed in the list): a recording whose
     /// clamps spend all of it is followed, after the reset, by one whose
     /// small record still runs.
+    ///
+    /// Written for `VICTORY_INDIRECT_REST=1` (an oversized record takes the
+    /// rest of the budget), the default until f4b48ad turned it off; under
+    /// the default it is skipped.
     #[test]
     fn host_list_budget_starts_empty_at_each_submission() {
+        if rest() == 0 {
+            eprintln!("skipped: checks VICTORY_INDIRECT_REST=1 behaviour");
+            return;
+        }
         let Some(host) = super::host() else {
             return;
         };
@@ -3147,8 +3155,15 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
 
     /// Records past the list's budget come out empty, and one read by many
     /// executions is charged for each.
+    ///
+    /// Written for `VICTORY_INDIRECT_REST=1`, like
+    /// `host_list_budget_starts_empty_at_each_submission`; skipped otherwise.
     #[test]
     fn warp_batch_charges_every_execution() {
+        if rest() == 0 {
+            eprintln!("skipped: checks VICTORY_INDIRECT_REST=1 behaviour");
+            return;
+        }
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
