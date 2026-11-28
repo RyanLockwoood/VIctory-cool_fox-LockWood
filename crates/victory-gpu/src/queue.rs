@@ -929,6 +929,9 @@ extern "system" fn present(
     // Slow frames into PIX timing captures (`VICTORY_PIX_STUTTER`).
     #[cfg(windows)]
     crate::pix::stutter::presented();
+    // Scroll Lock: MMCSS on or off (`crate::mmcss`).
+    #[cfg(windows)]
+    crate::mmcss::poll_key();
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
