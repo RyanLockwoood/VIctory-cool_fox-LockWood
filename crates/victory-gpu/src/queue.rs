@@ -926,6 +926,9 @@ extern "system" fn present(
         release_held(forces());
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    // Slow frames into PIX timing captures (`VICTORY_PIX_STUTTER`).
+    #[cfg(windows)]
+    crate::pix::stutter::presented();
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
