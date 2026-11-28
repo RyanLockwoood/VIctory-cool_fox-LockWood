@@ -503,6 +503,7 @@ fn run(host: &Host, f: impl FnOnce(&ID3D12GraphicsCommandList)) -> Option<()> {
         let done = host.queue.Signal(&fence, 1).and_then(|()| fence.SetEventOnCompletion(1, event));
         if done.is_ok() {
             WaitForSingleObject(event, INFINITE);
+            crate::pix::woke(event);
         }
         let _ = CloseHandle(event);
         done.ok()

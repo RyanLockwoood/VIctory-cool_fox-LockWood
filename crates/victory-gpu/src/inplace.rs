@@ -712,6 +712,7 @@ impl Rig {
             if WaitForSingleObject(self.event, 10_000).0 != 0 {
                 return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL));
             }
+            crate::pix::woke(self.event);
             self.device.GetDeviceRemovedReason()
         }
     }

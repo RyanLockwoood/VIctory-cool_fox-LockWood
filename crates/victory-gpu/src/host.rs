@@ -312,6 +312,7 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
         if a.fence.GetCompletedValue() < a.value {
             a.fence.SetEventOnCompletion(a.value, a.event)?;
             WaitForSingleObject(a.event, INFINITE);
+            crate::pix::woke(a.event);
         }
     }
     let us = started.elapsed().as_micros() as u64;
@@ -820,6 +821,7 @@ fn card_clock_watch(clock: &'static CardClock) {
         unsafe {
             if clock.fence.SetEventOnCompletion(target, event).is_ok() {
                 WaitForSingleObject(event, INFINITE);
+                crate::pix::woke(event);
             }
         }
         seen = target;
@@ -3449,6 +3451,7 @@ fn late_helper() {
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(Some(target));
                 WaitForSingleObject(event, INFINITE);
+                crate::pix::woke(event);
             }
         }
         {
@@ -3611,6 +3614,7 @@ fn relay_worker() {
                 let waited = unsafe {
                     host.fence.SetEventOnCompletion(target, event).map(|()| {
                         WaitForSingleObject(event, INFINITE);
+                        crate::pix::woke(event);
                     })
                 };
                 if waited.is_err() {
@@ -4902,6 +4906,7 @@ impl Host {
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(None);
                     WaitForSingleObject(event, INFINITE);
+                    crate::pix::woke(event);
                     return Ok(behind);
                 }
                 // In the order of the queue: the sends of title bytes so
@@ -4917,6 +4922,7 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(None);
                 WaitForSingleObject(event, INFINITE);
+                crate::pix::woke(event);
                 Ok(after)
             })()
         };
@@ -5208,6 +5214,7 @@ impl Host {
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
                     WaitForSingleObject(self.event, INFINITE);
+                    crate::pix::woke(self.event);
                     stood(waiting);
                     working(was_working);
                     Ok(())
@@ -5485,6 +5492,7 @@ impl Host {
                             #[cfg(feature = "diagnostics")]
                             let _card = crate::timeline::card_wait(Some(*submitted));
                             WaitForSingleObject(self.event, INFINITE);
+                            crate::pix::woke(self.event);
                             stood(waiting);
                             working(true);
                         }
@@ -5955,6 +5963,7 @@ impl Host {
                         #[cfg(feature = "diagnostics")]
                         let _card = crate::timeline::card_wait(Some(*submitted));
                         WaitForSingleObject(self.event, INFINITE);
+                        crate::pix::woke(self.event);
                         stood(started);
                         working(true);
                     }

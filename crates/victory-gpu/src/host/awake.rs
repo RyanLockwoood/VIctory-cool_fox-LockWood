@@ -198,6 +198,7 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
         }
         if result.is_ok() && fence.GetCompletedValue() < value && fence.SetEventOnCompletion(value, event).is_ok() {
             WaitForSingleObject(event, INFINITE);
+            crate::pix::woke(event);
         }
         let _ = CloseHandle(event);
         result

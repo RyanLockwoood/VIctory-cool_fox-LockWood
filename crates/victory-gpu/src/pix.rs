@@ -21,6 +21,22 @@ struct Pix {
     report_counter: ReportCounter,
     allocated: Option<MemoryEvent>,
     freed: Option<MemoryEvent>,
+    woke: Option<Woke>,
+}
+
+/// pix3_win.h: `void WINAPI PIXNotifyWakeFromFenceSignal(HANDLE event)`.
+type Woke = unsafe extern "system" fn(event: *mut core::ffi::c_void);
+
+/// The thread woke from waiting on `event`, which a fence's
+/// `SetEventOnCompletion` signals (with `VICTORY_PIX`): a PIX timing capture
+/// then joins the wait to the work on the card that ended it.
+pub(crate) fn woke(event: windows::Win32::Foundation::HANDLE) {
+    if let Some(f) = pix().and_then(|p| p.woke)
+        && !event.is_invalid()
+    {
+        // SAFETY: the export's signature; the handle is only recorded.
+        unsafe { f(event.0) };
+    }
 }
 
 /// Allocator ids in PIX's memory view: staging blocks of textures (64 MiB
@@ -99,6 +115,10 @@ fn load() -> Option<Pix> {
         report_counter: unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, ReportCounter>(report) },
         allocated: event(c"PIXRecordMemoryAllocationEvent"),
         freed: event(c"PIXRecordMemoryFreeEvent"),
+        // SAFETY: a loaded module and a NUL-terminated name; the export's
+        // documented signature (pix3_win.h).
+        woke: unsafe { GetProcAddress(module, c"PIXNotifyWakeFromFenceSignal".as_ptr().cast()) }
+            .map(|f| unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, Woke>(f) }),
     })
 }
 
@@ -524,6 +544,15 @@ mod tests {
         report_memory();
         counter(name!("Victory: test counter"), 1.5);
         assert!(pix().is_some_and(|p| p.allocated.is_some() && p.freed.is_some()), "the memory event exports are found");
+        assert!(pix().is_some_and(|p| p.woke.is_some()), "the fence wake export is found");
+        // SAFETY: a plain event of our own.
+        let event = unsafe { windows::Win32::System::Threading::CreateEventW(None, false, true, None) }.unwrap();
+        woke(event);
+        woke(windows::Win32::Foundation::HANDLE::default());
+        // SAFETY: our own handle.
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(event);
+        }
         let block = vec![0u8; 1 << 20];
         allocated(STAGING_BLOCKS, block.as_ptr(), block.len() as u64);
         freed(STAGING_BLOCKS, block.as_ptr(), block.len() as u64);
