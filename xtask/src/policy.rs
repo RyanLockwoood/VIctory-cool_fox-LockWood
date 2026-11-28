@@ -16,6 +16,8 @@ const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    // Our own source diffs, kept for reference; the content checks still apply.
+    "diff", "patch",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
@@ -236,6 +238,7 @@ mod tests {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
+        assert!(check("analysis/x.diff", b"--- a/x.rs\n+++ b/x.rs\n").is_empty());
     }
 
     #[test]
