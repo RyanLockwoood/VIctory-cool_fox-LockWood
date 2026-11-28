@@ -1725,16 +1725,34 @@ impl Staging {
                 linear.fill(0);
                 continue;
             }
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
+            let timed = detile_timing().then(std::time::Instant::now);
+            let detiled = self.layout.detile(tiled, mip, slice, linear, pitch, pitch * rows as usize);
+            if let Some(started) = timed {
+                use std::sync::atomic::Ordering::Relaxed;
+                DETILE_TIMING[0].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+                DETILE_TIMING[1].fetch_add(len as u64, Relaxed);
+                DETILE_TIMING[2].fetch_add(1, Relaxed);
+            }
+            if let Err(e) = detiled {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
             }
         }
     }
 }
+
+/// `VICTORY_DETILE_TIMING=1`: the time the processor spends detiling title
+/// textures into their staging buffers, apart from reading, hashing and
+/// waiting (the frame line's "the rest"). It says whether detiling on the
+/// card would pay. Off by default (two clock reads per subresource).
+pub(crate) fn detile_timing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DETILE_TIMING").as_deref() == Ok("1"))
+}
+
+/// With [`detile_timing`]: microseconds detiling, bytes written and
+/// subresources detiled, since the last frame-rate line.
+pub(crate) static DETILE_TIMING: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Lets go of a title texture's staging buffer (lists that recorded an
 /// upload from it hold it until they have run); the next upload makes one

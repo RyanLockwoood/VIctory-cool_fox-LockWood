@@ -8933,6 +8933,17 @@ impl Meter {
                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
                 );
             }
+            if crate::texture::detile_timing() {
+                let [us, bytes, parts] =
+                    [0, 1, 2].map(|i| crate::texture::DETILE_TIMING[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                tracing::info!(
+                    "texture detiling per frame, all threads (VICTORY_DETILE_TIMING=1): {:.2} ms, {:.1} MB in {parts:.0} \
+                     subresources ({:.0} MB/s); against the refreshes' {all:.1} ms above",
+                    us / 1000.0,
+                    bytes / 1e6,
+                    if us > 0.0 { bytes / us } else { 0.0 },
+                );
+            }
             let [through, left, filled, short] =
                 [0, 1, 2, 3].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if through + left + filled > 0.0 {
