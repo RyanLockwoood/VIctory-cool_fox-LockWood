@@ -3,6 +3,8 @@
 //! not change keeps its cached translations. Also lists every `VICTORY_*`
 //! switch the translator reads, whose values join the key at run time.
 //! Reads only this crate's `src` folder; writes nothing but cargo directives.
+//! Test-only files (`*_tests.rs`, compiled only under `cfg(test)`) are left
+//! out: they cannot change a translation, so editing them keeps the key.
 
 use std::path::{Path, PathBuf};
 
@@ -14,10 +16,17 @@ fn files(dir: &Path, out: &mut Vec<PathBuf>) {
         let p = e.path();
         if p.is_dir() {
             files(&p, out);
-        } else if p.extension().is_some_and(|x| x == "rs") {
+        } else if p.extension().is_some_and(|x| x == "rs") && !is_test_only(&p) {
             out.push(p);
         }
     }
+}
+
+/// A `*_tests.rs` file: `emit/mod.rs` declares each under `cfg(test)`.
+fn is_test_only(p: &Path) -> bool {
+    p.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with("_tests.rs"))
 }
 
 /// FNV-1a, 64 bits, two lanes with different offsets: a mismatch only costs
@@ -41,7 +50,11 @@ fn main() {
     let mut state = [0xcbf2_9ce4_8422_2325u64, 0x8422_2325_cbf2_9ce4u64];
     let mut switches = std::collections::BTreeSet::new();
     for p in &list {
-        let rel = p.strip_prefix(&src).unwrap_or(p).to_string_lossy().replace('\\', "/");
+        let rel = p
+            .strip_prefix(&src)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .replace('\\', "/");
         let text = std::fs::read(p).unwrap_or_default();
         fnv(&mut state, rel.as_bytes());
         fnv(&mut state, &(text.len() as u64).to_le_bytes());
@@ -59,7 +72,13 @@ fn main() {
             rest = &tail[end..];
         }
     }
-    println!("cargo:rustc-env=VICTORY_SHADER_SOURCE_HASH={:016x}{:016x}", state[0], state[1]);
+    println!(
+        "cargo:rustc-env=VICTORY_SHADER_SOURCE_HASH={:016x}{:016x}",
+        state[0], state[1]
+    );
     let joined: Vec<_> = switches.into_iter().collect();
-    println!("cargo:rustc-env=VICTORY_SHADER_SWITCHES={}", joined.join(","));
+    println!(
+        "cargo:rustc-env=VICTORY_SHADER_SWITCHES={}",
+        joined.join(",")
+    );
 }
