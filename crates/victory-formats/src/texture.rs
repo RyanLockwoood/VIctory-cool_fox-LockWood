@@ -599,6 +599,55 @@ impl Layout {
         self.mips.get(mip as usize).map_or(0, |m| m.depth)
     }
 
+    /// What a shader needs to detile one subresource (mip `mip` of array
+    /// slice `slice`, or every depth slice of a 3D mip, as
+    /// [`Layout::detile`] takes it): the address of every element is
+    /// `base[z] + row part + column part`, from three small tables. `None`
+    /// where [`Layout::detile`] refuses too.
+    pub fn detile_plan(&self, mip: u32, slice: u32) -> Option<DetilePlan> {
+        let m = self.mips.get(mip as usize)?;
+        if !self.addressable() {
+            return None;
+        }
+        let zs: Vec<u32> = if self.desc.dimension == Dimension::Tex3d {
+            if slice != 0 {
+                return None;
+            }
+            (0..m.depth).collect()
+        } else {
+            if slice >= self.slices {
+                return None;
+            }
+            vec![slice]
+        };
+        let linear = self.desc.swizzle == Swizzle::LINEAR;
+        let mut bases = Vec::with_capacity(zs.len());
+        let mut depth_bits = Vec::with_capacity(zs.len());
+        for z in zs {
+            let (s, inner) = self.split(z);
+            bases.push(u64::from(s) * self.slice_size + m.offset);
+            depth_bits.push(if linear { 0 } else { self.pattern[2][inner as usize] });
+        }
+        let tail = m.tail.map_or((0, 0), |t| (t.x, t.y));
+        Some(DetilePlan {
+            width: m.width,
+            height: m.height,
+            element_bytes: self.desc.element_bytes,
+            linear,
+            pitch: m.pitch,
+            block_width: self.block[0],
+            block_height: self.block[1],
+            block_log2: self.alignment.trailing_zeros(),
+            blocks_per_row: if linear { 0 } else { m.pitch / self.block[0] },
+            tail_x: tail.0,
+            tail_y: tail.1,
+            bases,
+            depth_bits,
+            columns: if linear { Vec::new() } else { self.pattern[0].clone() },
+            rows: if linear { Vec::new() } else { self.pattern[1].clone() },
+        })
+    }
+
     /// The bytes from the texture's start that mip `first` and the smaller
     /// ones take: the smaller a mip, the nearer the start it lies, so a
     /// title that streams textures has memory for the smaller mips only and
@@ -930,9 +979,116 @@ impl Texture {
     }
 }
 
+/// One subresource's addressing as plain numbers and tables, for a detiling
+/// shader ([`Layout::detile_plan`]). [`DetilePlan::offset`] is the shader's
+/// formula on the processor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetilePlan {
+    /// Elements per row and rows.
+    pub width: u32,
+    pub height: u32,
+    pub element_bytes: u32,
+    pub linear: bool,
+    /// Padded elements per row (linear rows).
+    pub pitch: u32,
+    pub block_width: u32,
+    pub block_height: u32,
+    pub block_log2: u32,
+    pub blocks_per_row: u32,
+    /// Where a mip in the tail starts inside the tail block, in elements.
+    pub tail_x: u32,
+    pub tail_y: u32,
+    /// Per depth slice of the subresource (1 for 2D): byte offset of the
+    /// mip in the texture, and the depth part of the in-block offset.
+    pub bases: Vec<u64>,
+    pub depth_bits: Vec<u32>,
+    /// In-block byte offsets by column (`x % block_width`) and by row
+    /// (`y % block_height`).
+    pub columns: Vec<u32>,
+    pub rows: Vec<u32>,
+}
+
+impl DetilePlan {
+    /// Byte offset of element (`x`, `y`) in depth slice `z` of the
+    /// subresource, in the tiled texture.
+    pub fn offset(&self, x: u32, y: u32, z: u32) -> u64 {
+        let base = self.bases[z as usize];
+        let n = u64::from(self.element_bytes);
+        if self.linear {
+            return base + (u64::from(y) * u64::from(self.pitch) + u64::from(x)) * n;
+        }
+        let (x, y) = (x + self.tail_x, y + self.tail_y);
+        let row = (u64::from(y / self.block_height) * u64::from(self.blocks_per_row) << self.block_log2)
+            + u64::from(self.rows[(y % self.block_height) as usize] | self.depth_bits[z as usize]);
+        let column = (u64::from(x / self.block_width) << self.block_log2)
+            + u64::from(self.columns[(x % self.block_width) as usize]);
+        base + row + column
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The detiling shader's formula ([`DetilePlan::offset`]) finds every
+    /// element where [`Layout::offset`] does: each mode that has tables,
+    /// every element size, odd sizes, mips down into the tail, arrays and
+    /// 3D textures.
+    #[test]
+    fn detile_plans_address_every_element_as_the_layout_does() {
+        let modes = [
+            Swizzle::LINEAR,
+            Swizzle::SW_256B_S,
+            Swizzle::SW_256B_D,
+            Swizzle::SW_4KB_S,
+            Swizzle::SW_4KB_D,
+            Swizzle::SW_64KB_S,
+            Swizzle::SW_64KB_D,
+        ];
+        let mut checked = 0u64;
+        for swizzle in modes {
+            for bpe in [1, 2, 4, 8, 16] {
+                for (dimension, w, h, depth, mips) in [
+                    (Dimension::Tex2d, 256, 256, 1, 9),
+                    (Dimension::Tex2d, 300, 77, 1, 9),
+                    (Dimension::Tex2d, 33, 1000, 3, 10),
+                    (Dimension::Tex3d, 40, 24, 12, 6),
+                ] {
+                    let d = Desc { dimension, width: w, height: h, depth, mips, element_bytes: bpe, block: 1, samples: 1, swizzle };
+                    let Ok(layout) = Layout::new(&d) else {
+                        continue;
+                    };
+                    if !layout.addressable() {
+                        continue;
+                    }
+                    let slices = if dimension == Dimension::Tex3d { 1 } else { depth };
+                    for mip in 0..layout.mips.len() as u32 {
+                        for slice in 0..slices {
+                            let plan = layout.detile_plan(mip, slice).unwrap();
+                            let m = &layout.mips[mip as usize];
+                            for z in 0..plan.bases.len() as u32 {
+                                let absolute = if dimension == Dimension::Tex3d { z } else { slice };
+                                for y in 0..m.height {
+                                    for x in 0..m.width {
+                                        assert_eq!(
+                                            plan.offset(x, y, z),
+                                            layout.offset(mip, x, y, absolute).unwrap(),
+                                            "{swizzle:?} {bpe} B {dimension:?} {w}x{h}x{depth} mip {mip} slice {slice} ({x}, {y}, {z})"
+                                        );
+                                        checked += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 1_000_000, "{checked}");
+        // What the layout cannot address has no plan either.
+        let xor = Layout::new(&desc(64, 64, 1, 4, Swizzle::SW_64KB_D_X)).unwrap();
+        assert_eq!(xor.addressable(), xor.detile_plan(0, 0).is_some());
+    }
 
     fn desc(w: u32, h: u32, mips: u32, bpe: u32, swizzle: Swizzle) -> Desc {
         Desc {
