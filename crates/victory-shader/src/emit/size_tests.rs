@@ -311,6 +311,50 @@ fn image_atomics_on_64_bit_values() {
     }
 }
 
+/// Float image atomics on an R32_FLOAT view: texel 0 takes a maximum, a
+/// minimum and a compare-exchange in turn; texels 1 and 2 keep what the
+/// minimum and the compare-exchange returned.
+#[test]
+fn float_image_atomics() {
+    let words = [
+        0xF40C_0201u32, // s_load_dwordx8 s[8:15], s[2:3], 0
+        0xFA00_0000,
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x7E00_0280, // v_mov_b32 v0, 0
+        0x7E04_02F4, // v_mov_b32 v2, 2.0
+        0xF07C_3108, // image_atomic_fmax v2, v[0:1], s[8:15] dmask:0x1 2D glc
+        0x0002_0200,
+        0x7E06_02F3, // v_mov_b32 v3, -1.0
+        0xF078_3108, // image_atomic_fmin v3, v[0:1], s[8:15] dmask:0x1 2D glc
+        0x0002_0300,
+        0x7E08_02F6, // v_mov_b32 v4, 4.0 (replacement)
+        0x7E0A_02F3, // v_mov_b32 v5, -1.0 (comparand)
+        0xF074_3308, // image_atomic_fcmpswap v[4:5], v[0:1], s[8:15] dmask:0x3 2D glc
+        0x0002_0400,
+        0x7E00_0281, // v_mov_b32 v0, 1
+        0xF07C_3108, // image_atomic_fmax v3, v[0:1], s[8:15] dmask:0x1 2D glc
+        0x0002_0300,
+        0x7E00_0282, // v_mov_b32 v0, 2
+        0xF078_3108, // image_atomic_fmin v4, v[0:1], s[8:15] dmask:0x1 2D glc
+        0x0002_0400,
+        0xBE84_0380, // s_mov_b32 s4, 0
+        0xBE85_0380, // s_mov_b32 s5, 0
+    ];
+    let shader = build(&[TABLE, &words, STORE].concat(), (8, 0)).expect("translates");
+    let texel = [[0.0; 4]; 1];
+    let views = [
+        View::FloatTextureUav(3, 1),
+        View::Texture(1, 1, &texel),
+        View::RawUav(2),
+    ];
+    for (label, got) in run(&shader, &views) {
+        let got: Vec<f32> = got.into_iter().map(f32::from_bits).collect();
+        // max(0, 2) = 2, min(2, -1) = -1, -1 swapped for 4; the minimum
+        // returned 2, the compare-exchange -1.
+        assert_eq!(got, [4.0, 2.0, -1.0], "{label}");
+    }
+}
+
 /// A load past the wave's cache (GLC) of a buffer other groups write: its
 /// view is globally coherent on the host, as is every access to it.
 #[test]

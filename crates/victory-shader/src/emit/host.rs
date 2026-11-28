@@ -1004,6 +1004,8 @@ pub enum View<'a> {
     UintTextureUav(u32, u32),
     /// An R32G32_UINT texture UAV (width, height), zeroed (64-bit atomics).
     Uint2TextureUav(u32, u32),
+    /// An R32_FLOAT texture UAV (width, height), zeroed (float atomics).
+    FloatTextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
     /// A typed buffer UAV pre-filled with `data` (`format`, bytes per element).
@@ -1350,6 +1352,26 @@ impl Host {
                                 h,
                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                                 DXGI_FORMAT_R32_UINT,
+                            ),
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        )?;
+                        dev.CreateUnorderedAccessView(&t, None, None, at);
+                        let pitch = (w * 4).next_multiple_of(256);
+                        let rb = make(
+                            D3D12_HEAP_TYPE_READBACK,
+                            &buffer(u64::from(pitch * h), D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        uavs.push((t, Some((w, h)), 1, rb));
+                    }
+                    View::FloatTextureUav(w, h) => {
+                        let t = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &texture_as(
+                                w,
+                                h,
+                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                DXGI_FORMAT_R32_FLOAT,
                             ),
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         )?;

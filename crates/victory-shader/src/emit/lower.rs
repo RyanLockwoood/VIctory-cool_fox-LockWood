@@ -10793,6 +10793,126 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Or, old, x)
     }
 
+    /// `image_atomic_fmin`, `_fmax` and `_fcmpswap` on one 32-bit texel at
+    /// `cs`, through views annotated with `props` (UAV kind and flags).
+    /// The host has no float minimum or maximum on a typed view: the texel
+    /// is exchanged, by its bits, for the smaller (larger) of itself and the
+    /// value until no other thread got in between, as `global_atomic_fmin`
+    /// does. Each failed pass means another one's succeeded; the limit only
+    /// keeps a broken card from hanging.
+    #[allow(clippy::too_many_arguments)]
+    fn image_float_atomic(
+        &mut self,
+        inst: &Inst,
+        op: &str,
+        guard: Option<V>,
+        site: Site,
+        src: &Source,
+        props: u32,
+        cs: Vec<V>,
+    ) -> Result<(), Why> {
+        let Fields::Image {
+            data, dmask, cache, ..
+        } = &inst.fields
+        else {
+            unreachable!()
+        };
+        let compare = op == "fcmpswap";
+        // One float, or a replacement and a comparand; no 64-bit floats.
+        if *dmask != if compare { 3 } else { 1 } {
+            return Err("a float image atomic data mask");
+        }
+        let Operand::Vector { reg, .. } = *data else {
+            return Err("image atomic data");
+        };
+        let vals = self.vgprs(inst, data, if compare { 2 } else { 1 })?;
+        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let iu = self.s.m.undef(i32t);
+        let bits = self.handle(site, src, false, (props, 0x105))?;
+        let floats = if compare {
+            None
+        } else {
+            // Our declarations have four channels.
+            self.s.flags |= flags::TYPED_UAV_LOADS;
+            Some(self.handle(site, src, false, (props, 0x409))?)
+        };
+        let at = self.begin_guarded(guard);
+        let was = match floats {
+            None => {
+                // shortcut: compared by bits, so +0 and -0 differ and a NaN
+                // matches only itself (the console compares them as floats).
+                let mut args = vec![bits];
+                args.extend(&cs);
+                args.extend([vals[1], vals[0]]);
+                self.s.op(
+                    self.cur,
+                    "atomicCompareExchange.i32",
+                    Attr::NoUnwind,
+                    i32t,
+                    79,
+                    &args,
+                )
+            }
+            Some(floats) => {
+                let head = self.cur;
+                let mut args = vec![floats, iu];
+                args.extend(&cs);
+                args.extend([iu, iu, iu]);
+                let first = self.s.op(
+                    head,
+                    "textureLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    66,
+                    &args,
+                );
+                let first = self.s.m.extract(head, first, 0);
+                let first = self.as_int(first);
+                let (pass, done) = (self.s.m.new_block(), self.s.m.new_block());
+                self.s.m.terminate(head, Term::Br(pass));
+                self.cur = pass;
+                let seen = self.s.m.phi(pass, i32t);
+                let n = self.s.m.phi(pass, i32t);
+                let (fv, fseen) = (self.as_float(vals[0]), self.as_float(seen));
+                // `dx.op.binary`: FMax 35, FMin 36.
+                let pick = if op == "fmin" { 36 } else { 35 };
+                let wanted = self
+                    .s
+                    .op(pass, "binary.f32", Attr::ReadNone, f32t, pick, &[fseen, fv]);
+                let wanted = self.as_int(wanted);
+                let mut args = vec![bits];
+                args.extend(&cs);
+                args.extend([seen, wanted]);
+                let found = self.s.op(
+                    pass,
+                    "atomicCompareExchange.i32",
+                    Attr::NoUnwind,
+                    i32t,
+                    79,
+                    &args,
+                );
+                let one = self.s.m.i32(1);
+                let n1 = self.s.m.bin(pass, Bin::Add, n, one);
+                let lost = self.s.m.cmp(pass, pred::NE, found, seen);
+                let limit = self.s.m.i32(1 << 16);
+                let more = self.s.m.cmp(pass, pred::IULT, n1, limit);
+                let again = self.s.m.bin(pass, Bin::And, lost, more);
+                self.s.m.terminate(pass, Term::CondBr(again, pass, done));
+                let zero = self.s.m.i32(0);
+                self.s.m.set_phi(seen, vec![(first, head), (found, pass)]);
+                self.s.m.set_phi(n, vec![(zero, head), (n1, pass)]);
+                self.cur = done;
+                found
+            }
+        };
+        // A lane left out keeps its register: the value it would have sent.
+        let was = self.end_guarded(at, &[(was, vals[0])])[0];
+        if cache.glc {
+            self.write(inst, Reg::V(reg), was, None);
+        }
+        Ok(())
+    }
+
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Image {
             data,
@@ -10877,6 +10997,18 @@ impl<'a> Lower<'a> {
         let rov = if ordered { 0x2000 } else { 0 };
         let props = (kind | if uav { 0x1000 } else { 0 } | rov, 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
+            if matches!(op, "fmin" | "fmax" | "fcmpswap") {
+                if *d16 {
+                    return Err("a 16-bit image atomic");
+                }
+                let iu = self.s.m.undef(self.s.t.i32);
+                let mut cs = vec![iu; 3];
+                for (k, slot) in cs.iter_mut().enumerate().take(coords) {
+                    *slot = addr_val(self, k)?;
+                }
+                let props = kind | 0x1000 | rov;
+                return self.image_float_atomic(inst, op, guard, site, src, props, cs);
+            }
             // GLC returns the old value. DXIL implements subtraction by adding
             // the two's complement of the operand at the same width.
             let code = match op {
