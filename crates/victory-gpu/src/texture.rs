@@ -16,7 +16,7 @@
 //! (every mip and array slice), depth and stencil planes are not.
 
 pub(crate) mod ahead;
-#[allow(dead_code)] // Step 1: proven against the processor's detiler, not recorded yet.
+#[allow(dead_code)] // `GpuDetiler::new` and the test helpers are used by tests only.
 pub(crate) mod detile_gpu;
 
 use std::collections::HashMap;
@@ -98,6 +98,11 @@ pub(crate) struct Staging {
     /// (`title_memory_reading`) instead of taking `no_wait()` /
     /// `refresh_unlocked()` or the 30-frame partial-read throttle.
     exact: std::sync::atomic::AtomicBool,
+    /// With `VICTORY_GPU_DETILE=1`, for a texture the card can detile: the
+    /// plan of each part. The staging buffer then holds the title's tiled
+    /// bytes as they are (`read` of them), and lists detile them on the card
+    /// ([`detile_gpu`]).
+    gpu: Option<Vec<victory_formats::texture::DetilePlan>>,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -1012,6 +1017,42 @@ fn record_upload(
         unsafe { list.list.ResourceBarrier(&[aliasing]) };
     }
     crate::list::ensure_state(list, resource, COPY_DEST);
+    // Detiled on the card (`VICTORY_GPU_DETILE=1`): the staging buffer holds
+    // the tiled bytes; the list's side list detiles them into rows in the
+    // card's memory, laid out as the footprints, and the copies below read
+    // those (from offset 0) instead of the staging buffer.
+    let card_rows;
+    let (source, base) = match staging.gpu.as_ref() {
+        Some(plans) if windows::core::Interface::as_raw(source) == windows::core::Interface::as_raw(&staging.buffer) => {
+            let total = staging
+                .footprints
+                .iter()
+                .zip(&staging.rows)
+                .map(|(f, &r)| f.Offset + u64::from(f.Footprint.RowPitch) * u64::from(r) * u64::from(f.Footprint.Depth))
+                .max()
+                .unwrap_or(0);
+            let recorded = list.detile_work(|host, work| {
+                detile_gpu::record(
+                    host,
+                    work,
+                    plans,
+                    &staging.footprints,
+                    &staging.rows,
+                    (&staging.buffer, staging.base, staging.read as u64),
+                    total,
+                )
+            });
+            let Some(rows) = recorded else {
+                // The staging buffer is not in rows: nothing the processor
+                // could copy. The texture keeps what it had.
+                once!(resource = ?resource, "VICTORY_GPU_DETILE=1: a texture's detiling on the card could not be recorded; not uploaded");
+                return;
+            };
+            card_rows = rows;
+            (&card_rows, 0)
+        }
+        _ => (source, base),
+    };
     // The staging/plane upload buffer lives until the list is reset.
     for (i, footprint) in staging.footprints.iter().enumerate() {
         #[cfg(feature = "diagnostics")]
@@ -1687,6 +1728,22 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Detiled on the card: the tiled bytes as they are (the lists'
+        // side lists detile them).
+        if self.gpu.is_some() {
+            let timed = detile_timing().then(std::time::Instant::now);
+            let n = tiled.len().min(self.read).min(self.bytes as usize);
+            // SAFETY: the mapped staging buffer holds at least `bytes`; written
+            // only here, at submission, under `last`'s lock.
+            unsafe { std::ptr::copy_nonoverlapping(tiled.as_ptr(), self.data, n) };
+            if let Some(started) = timed {
+                use std::sync::atomic::Ordering::Relaxed;
+                DETILE_TIMING[0].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+                DETILE_TIMING[1].fetch_add(n as u64, Relaxed);
+                DETILE_TIMING[2].fetch_add(1, Relaxed);
+            }
+            return;
+        }
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -2135,6 +2192,20 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         );
     }
     drop(footprint_timer);
+    // Detiled on the card: the staging buffer holds the tiled bytes as
+    // they are, which may be more than the rows (`read` against `total`).
+    // Not for levels on demand (their levels are judged at each detiling).
+    let gpu = if on_demand {
+        None
+    } else {
+        let parts_mips = mips - first;
+        detile_gpu::plans(
+            &layout,
+            (0..count).map(|i| (first + i % parts_mips, if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { 0 } else { i / parts_mips })),
+            read as u64,
+        )
+    };
+    let total = if gpu.is_some() { total.max(read as u64) } else { total };
     let buffer_timer = crate::draw::TextureHeapTimer::phase(&STAGING_BUFFER_US);
     let (piece, buffer, base, data) = match crate::pool::staging(host, total) {
         Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data),
@@ -2196,6 +2267,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
         exact: std::sync::atomic::AtomicBool::new(BAKING.get()),
+        gpu,
     });
     map.insert(resource as usize, s.clone());
     Some(s)

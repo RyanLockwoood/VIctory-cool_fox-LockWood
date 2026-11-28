@@ -124,8 +124,11 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     super::PICKING.set(Some(there));
     let staging = super::staging(resource, &copy, first);
     super::PICKING.set(None);
+    // (Not one detiled on the card, `VICTORY_GPU_DETILE=1`: its staging
+    // buffer holds tiled bytes, which this queue's plain copies cannot
+    // place; it is uploaded by a list.)
     let Some(staging) = staging.filter(|s| {
-        !s.on_demand && s.first == s.level0 && !s.uploaded.load(Relaxed) && s.once.load(Relaxed)
+        !s.on_demand && s.first == s.level0 && !s.uploaded.load(Relaxed) && s.once.load(Relaxed) && s.gpu.is_none()
     }) else {
         copy.ahead.store(LISTED, Relaxed);
         return turned_down();
@@ -372,6 +375,12 @@ mod tests {
     /// first on its way, and a later one is the list's.
     #[test]
     fn a_placed_texture_is_filled_ahead_of_the_lists() {
+        // With `VICTORY_GPU_DETILE=1` such a texture is uploaded by a list
+        // instead (its staging holds tiled bytes): nothing to check here.
+        if crate::texture::detile_gpu::on() {
+            eprintln!("skipped: VICTORY_GPU_DETILE=1 sends this texture through a list");
+            return;
+        }
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
         let Some(host) = crate::host::host() else { return };
         // 256x256 BC7, nine levels.
@@ -449,6 +458,12 @@ mod tests {
 
     #[test]
     fn drain_waits_until_then_callbacks_have_run() {
+        // As above: with `VICTORY_GPU_DETILE=1` the ahead path turns this
+        // texture down by design.
+        if crate::texture::detile_gpu::on() {
+            eprintln!("skipped: VICTORY_GPU_DETILE=1 sends this texture through a list");
+            return;
+        }
         use std::sync::atomic::AtomicBool;
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
         let Some(_host) = crate::host::host() else { return };

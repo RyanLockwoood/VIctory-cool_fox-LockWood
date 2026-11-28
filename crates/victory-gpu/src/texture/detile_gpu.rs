@@ -3,18 +3,278 @@
 //! a [`DetilePlan`] (the in-block offsets as three small tables, so no mode
 //! needs code of its own).
 //!
-//! Step 1 of the plan in `docs/bug-journal.md` (2026-11-28): the shader and
-//! its proof against the processor's detiler. Nothing records it yet; a
-//! later step stages the tiled bytes as they are and detiles them here
-//! behind `VICTORY_GPU_DETILE=1`, with the processor's path as fallback.
+//! `VICTORY_GPU_DETILE=1` (off by default): a title texture all of whose
+//! staged levels the shader can detile keeps its staging buffer in the
+//! title's own tiled layout (one plain copy at refresh instead of the
+//! processor's detiling). A list that uploads it records, into a side list
+//! of its own ([`Work`]), a copy of those bytes into the card's memory and
+//! the detiling there into rows laid out as the upload's footprints; its
+//! own copy into the texture then reads those rows. The side list runs in
+//! a queue call of its own just before the submission's lists, so it is
+//! done before they copy, and the list's own pipeline and root signatures
+//! are never touched. Every other texture goes the processor's way, as
+//! before.
 //!
 //! [`Layout::detile`]: victory_formats::texture::Layout::detile
 
-use victory_formats::texture::DetilePlan;
+use std::sync::{Mutex, OnceLock};
+
+use victory_formats::texture::{DetilePlan, Layout};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::s;
+use windows::core::{Interface, s};
+
+/// Whether textures are detiled on the card (`VICTORY_GPU_DETILE=1`).
+pub(crate) fn on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_GPU_DETILE").as_deref() == Ok("1"))
+}
+
+/// The shader on the host's device, compiled once.
+fn detiler(device: &ID3D12Device) -> Option<&'static GpuDetiler> {
+    static DETILER: OnceLock<Option<GpuDetiler>> = OnceLock::new();
+    DETILER
+        .get_or_init(|| match GpuDetiler::new(device) {
+            Ok(d) => {
+                tracing::info!("VICTORY_GPU_DETILE=1: title textures the shader can detile are detiled on the card");
+                Some(d)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "VICTORY_GPU_DETILE=1, but the detile shader did not compile: the processor detiles");
+                None
+            }
+        })
+        .as_ref()
+}
+
+/// The plans of a staging buffer's parts (`parts`: the level and array
+/// slice of each, in footprint order), if the card can detile every one of
+/// them from `read` bytes of title memory; else `None` (the processor
+/// detiles the texture).
+pub(crate) fn plans(layout: &Layout, parts: impl Iterator<Item = (u32, u32)>, read: u64) -> Option<Vec<DetilePlan>> {
+    if !on() {
+        return None;
+    }
+    parts
+        .map(|(mip, slice)| layout.detile_plan(mip, slice).filter(|p| supported(p, read)))
+        .collect()
+}
+
+/// Commands that run in a queue call of their own just ahead of a host
+/// list's submission (the detiling of the textures it uploads), and the
+/// card memory they write, both held until the list is reset (every
+/// submission of it has run by then).
+pub(crate) struct Work {
+    pair: Option<crate::host::Prelude>,
+    closed: bool,
+    held: Vec<Chunk>,
+}
+
+// SAFETY: D3D12 objects (free-threaded), used under the host list's lock.
+unsafe impl Send for Work {}
+
+impl Work {
+    /// An open side list, from those kept or new.
+    pub(crate) fn new(host: &crate::host::Host) -> Option<Self> {
+        let pair = lock(&LISTS).pop().or_else(|| host.make_prelude())?;
+        // SAFETY: a kept pair's last execution finished before it was given
+        // back (its list's reset); a new one has none.
+        let reset = unsafe { pair.0.Reset().and_then(|()| pair.1.Reset(&pair.0, None)) };
+        if let Err(e) = reset {
+            tracing::warn!(error = %e, "no side list for detiling on the card");
+            return None;
+        }
+        Some(Self { pair: Some(pair), closed: false, held: Vec::new() })
+    }
+
+    /// Closes the side list (once).
+    pub(crate) fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        if let Some((_, list)) = &self.pair
+            // SAFETY: our open list.
+            && let Err(e) = unsafe { list.Close() }
+        {
+            tracing::warn!(error = %e, "a detiling side list did not close: its textures stay as they were");
+            self.pair = None;
+        }
+    }
+
+    /// The closed side list, to execute.
+    pub(crate) fn list(&self) -> Option<ID3D12CommandList> {
+        if !self.closed {
+            return None;
+        }
+        self.pair.as_ref().and_then(|(_, list)| list.cast().ok())
+    }
+}
+
+impl Drop for Work {
+    fn drop(&mut self) {
+        // Kept for the next list that detiles (a few; the rest are let go).
+        if let Some(pair) = self.pair.take() {
+            let mut kept = lock(&LISTS);
+            if kept.len() < 64 {
+                kept.push(pair);
+            }
+        }
+    }
+}
+
+/// Side lists kept for reuse: only ones whose execution has finished.
+static LISTS: Mutex<Vec<crate::host::Prelude>> = Mutex::new(Vec::new());
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A buffer in the card's memory, a power of two of at least 64 KiB, given
+/// back for reuse when dropped while few bytes wait.
+pub(crate) struct Chunk {
+    buffer: ID3D12Resource,
+    class: u32,
+}
+
+/// Bytes of chunks kept for reuse at most.
+const KEPT_MOST: u64 = 256 << 20;
+static KEPT: Mutex<(Vec<Chunk>, u64)> = Mutex::new((Vec::new(), 0));
+
+impl Drop for Chunk {
+    fn drop(&mut self) {
+        let size = 1u64 << self.class;
+        let mut kept = lock(&KEPT);
+        if kept.1 + size <= KEPT_MOST {
+            kept.1 += size;
+            kept.0.push(Chunk { buffer: self.buffer.clone(), class: self.class });
+        }
+    }
+}
+
+/// A chunk of at least `bytes`: a kept one of that size, or a new one.
+fn chunk(device: &ID3D12Device, bytes: u64) -> Option<Chunk> {
+    let class = bytes.max(64 << 10).next_power_of_two().trailing_zeros();
+    {
+        let mut kept = lock(&KEPT);
+        if let Some(i) = kept.0.iter().position(|c| c.class == class) {
+            let c = kept.0.swap_remove(i);
+            kept.1 -= 1 << class;
+            return Some(c);
+        }
+    }
+    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: 1 << class,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: a plain buffer.
+    let made = unsafe {
+        device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+    };
+    if let Err(e) = made {
+        tracing::warn!(error = %e, bytes, "no card memory for detiling a texture");
+        return None;
+    }
+    CHUNKS_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(Chunk { buffer: buffer?, class })
+}
+
+/// Chunks made since the start (for the tests and the memory counters).
+pub(crate) static CHUNKS_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The tables of a plan in an upload buffer, made once per set of tables
+/// (one per mode and element size) and kept.
+fn tables_buffer(host: &crate::host::Host, plan: &DetilePlan) -> Option<ID3D12Resource> {
+    struct Kept(std::collections::HashMap<Vec<u32>, ID3D12Resource>);
+    // SAFETY: D3D12 resources are free-threaded.
+    unsafe impl Send for Kept {}
+    static TABLES: Mutex<Option<Kept>> = Mutex::new(None);
+    let table = tables(plan);
+    let mut kept = lock(&TABLES);
+    let kept = &mut kept.get_or_insert_with(|| Kept(Default::default())).0;
+    if let Some(buffer) = kept.get(&table) {
+        return Some(buffer.clone());
+    }
+    let bytes = (table.len() as u64 * 4).max(4);
+    let (buffer, data) = host.upload_buffer(bytes)?;
+    // SAFETY: a mapped upload buffer of `bytes`; nothing reads it yet.
+    unsafe { std::ptr::copy_nonoverlapping(table.as_ptr().cast::<u8>(), data, table.len() * 4) };
+    kept.insert(table, buffer.clone());
+    Some(buffer)
+}
+
+/// Records into `work` the detiling of a staging buffer that holds `read`
+/// bytes of a texture's tiled memory (from `staging` at `base`), into card
+/// memory laid out as `footprints` (`rows` rows each, `total` bytes).
+/// Returns the buffer the list's copies into the texture read instead of
+/// the staging buffer (offsets from 0); `None` if nothing could be recorded.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record(
+    host: &crate::host::Host,
+    work: &mut Work,
+    plans: &[DetilePlan],
+    footprints: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT],
+    rows: &[u32],
+    (staging, base, read): (&ID3D12Resource, u64, u64),
+    total: u64,
+) -> Option<ID3D12Resource> {
+    // (The shader's addresses and the rows' offsets are 32-bit.)
+    if work.closed || plans.len() != footprints.len() || total > u64::from(u32::MAX) || read > u64::from(u32::MAX) {
+        return None;
+    }
+    let detiler = detiler(&host.device)?;
+    let list = work.pair.as_ref()?.1.clone();
+    let tiled = chunk(&host.device, read)?;
+    let linear = chunk(&host.device, total)?;
+    let tables = tables_buffer(host, &plans[0])?;
+    let barrier = crate::host::transition;
+    // SAFETY: an open side list; live buffers large enough for every
+    // plan (`read` and `total`), held by `work` until the list is reset.
+    unsafe {
+        list.CopyBufferRegion(&tiled.buffer, 0, staging, base, read);
+        list.ResourceBarrier(&[barrier(
+            &tiled.buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        )]);
+        let (tiled_at, tables_at, linear_at) =
+            (tiled.buffer.GetGPUVirtualAddress(), tables.GetGPUVirtualAddress(), linear.buffer.GetGPUVirtualAddress());
+        for ((plan, footprint), &n) in plans.iter().zip(footprints).zip(rows) {
+            let pitch = footprint.Footprint.RowPitch;
+            for z in 0..plan.bases.len() as u32 {
+                let at = footprint.Offset + u64::from(z) * u64::from(pitch) * u64::from(n);
+                let k = constants(plan, z, at as u32, pitch);
+                detiler.record(&list, plan, &k, (tiled_at, tables_at, linear_at));
+            }
+        }
+        // The rows are written before the list's copies read them; left
+        // readable as a copy's source (buffers decay to common between
+        // queue calls in any case).
+        list.ResourceBarrier(&[barrier(
+            &linear.buffer,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        )]);
+    }
+    let rows_buffer = linear.buffer.clone();
+    work.held.push(tiled);
+    work.held.push(linear);
+    DETILED.fetch_add(plans.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    Some(rows_buffer)
+}
+
+/// Subresources detiled on the card since the start.
+pub(crate) static DETILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The shader. Root constants (16): width, height, dwords per element,
 /// linear, pitch, block width, block height, log2 block bytes, blocks per
@@ -517,6 +777,187 @@ mod tests {
             card_s * 1e3,
             in_card_s * 1e3,
         );
+    }
+
+    /// The whole path on the host's own device and queue, as a run takes
+    /// it: a real texture uploaded once the processor's way (detiled rows
+    /// from staging) and once the card's way (tiled staging, the host list's
+    /// side list detiling into card memory, the list copying those rows),
+    /// through `Host::execute` (its submission runs the side list first).
+    /// Both textures are read back and must be equal, for 4-, 8- and
+    /// 16-byte elements, block-compressed and not, with mips, arrays and a
+    /// 3D texture, in several modes.
+    #[test]
+    fn a_texture_detiled_on_the_card_equals_the_processors() {
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let _turn = crate::indirect::tests::warp_turn();
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let readback = |size: u64| -> (ID3D12Resource, *mut u8) {
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut r: Option<ID3D12Resource> = None;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: a plain buffer, mapped for reading.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut r)
+                    .unwrap();
+                let r = r.unwrap();
+                r.Map(0, None, Some(&mut data)).unwrap();
+                (r, data.cast())
+            }
+        };
+        let location = |resource: &ID3D12Resource, footprint: Option<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>, index: u32| {
+            D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: a borrowed pointer the location never releases.
+                pResource: unsafe { std::mem::transmute_copy(resource) },
+                Type: if footprint.is_some() { D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT } else { D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX },
+                Anonymous: match footprint {
+                    Some(f) => D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
+                    None => D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: index },
+                },
+            }
+        };
+        let cases: [(DXGI_FORMAT, u32, u32, Dimension, u32, u32, u32, u32, Swizzle); 6] = [
+            (DXGI_FORMAT_R8G8B8A8_UINT, 4, 1, Dimension::Tex2d, 300, 77, 1, 9, Swizzle::SW_64KB_D),
+            (DXGI_FORMAT_R8G8B8A8_UINT, 4, 1, Dimension::Tex2d, 256, 256, 2, 9, Swizzle::SW_4KB_S),
+            (DXGI_FORMAT_BC1_UNORM, 8, 4, Dimension::Tex2d, 512, 256, 1, 10, Swizzle::SW_64KB_S),
+            (DXGI_FORMAT_BC7_UNORM, 16, 4, Dimension::Tex2d, 256, 128, 3, 8, Swizzle::SW_64KB_D),
+            (DXGI_FORMAT_BC7_UNORM, 16, 4, Dimension::Tex2d, 64, 64, 1, 7, Swizzle::SW_256B_D),
+            (DXGI_FORMAT_R32G32B32A32_UINT, 16, 1, Dimension::Tex3d, 40, 24, 12, 4, Swizzle::SW_64KB_S),
+        ];
+        let mut compared = 0;
+        for (format, bpe, block, dimension, w, h, depth, mips, swizzle) in cases {
+            let desc = Desc { dimension, width: w, height: h, depth, mips, element_bytes: bpe, block, samples: 1, swizzle };
+            let layout = Layout::new(&desc).unwrap();
+            assert!(layout.addressable(), "{desc:?}");
+            let texture_desc = D3D12_RESOURCE_DESC {
+                Dimension: if dimension == Dimension::Tex3d { D3D12_RESOURCE_DIMENSION_TEXTURE3D } else { D3D12_RESOURCE_DIMENSION_TEXTURE2D },
+                Width: u64::from(w),
+                Height: h,
+                DepthOrArraySize: depth as u16,
+                MipLevels: mips as u16,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            let count = if dimension == Dimension::Tex3d { mips } else { mips * depth };
+            let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+            let mut rows = vec![0u32; count as usize];
+            let mut total = 0;
+            // SAFETY: outputs for `count` subresources.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &texture_desc,
+                    0,
+                    count,
+                    0,
+                    Some(footprints.as_mut_ptr()),
+                    Some(rows.as_mut_ptr()),
+                    None,
+                    Some(&mut total),
+                );
+            }
+            let read = layout.size;
+            // The title's tiled bytes, different everywhere.
+            let mut tiled = vec![0u8; read as usize];
+            let mut seed = 0x2545_f491_u32 ^ swizzle.0 ^ (bpe << 12);
+            for b in &mut tiled {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                *b = seed as u8;
+            }
+            // The processor's way: rows in staging.
+            let (cpu_staging, cpu_data) = host.upload_buffer(total).unwrap();
+            let part = |i: usize| -> (u32, u32) { ((i as u32) % mips, (i as u32) / mips) };
+            for (i, f) in footprints.iter().enumerate() {
+                let (mip, slice) = part(i);
+                let pitch = f.Footprint.RowPitch as usize;
+                let len = pitch * rows[i] as usize * f.Footprint.Depth as usize;
+                // SAFETY: the subresource's part of the mapped staging buffer.
+                let linear = unsafe { std::slice::from_raw_parts_mut(cpu_data.add(f.Offset as usize), len) };
+                layout.detile(&tiled, mip, slice, linear, pitch, pitch * rows[i] as usize).unwrap();
+            }
+            // The card's way: the tiled bytes as they are.
+            let (gpu_staging, gpu_data) = host.upload_buffer(read).unwrap();
+            // SAFETY: a mapped upload buffer of `read` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(tiled.as_ptr(), gpu_data, tiled.len()) };
+            let plans: Vec<DetilePlan> = (0..count as usize)
+                .map(|i| {
+                    let (mip, slice) = part(i);
+                    layout.detile_plan(mip, if dimension == Dimension::Tex3d { 0 } else { slice }).unwrap()
+                })
+                .collect();
+            let made = |_| -> ID3D12Resource {
+                let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+                let mut r: Option<ID3D12Resource> = None;
+                // SAFETY: a valid texture description.
+                unsafe {
+                    host.device
+                        .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &texture_desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut r)
+                        .unwrap();
+                }
+                r.unwrap()
+            };
+            let [by_cpu, by_card] = [0, 1].map(made);
+            let backs = [readback(total), readback(total)];
+            let card_rows = list
+                .detile_work(|host, work| record(host, work, &plans, &footprints, &rows, (&gpu_staging, 0, read), total))
+                .expect("the detiling records");
+            // SAFETY: an open list; live resources, held below until it has run.
+            unsafe {
+                for (i, f) in footprints.iter().enumerate() {
+                    list.list.CopyTextureRegion(&location(&by_cpu, None, i as u32), 0, 0, 0, &location(&cpu_staging, Some(*f), 0), None);
+                    list.list.CopyTextureRegion(&location(&by_card, None, i as u32), 0, 0, 0, &location(&card_rows, Some(*f), 0), None);
+                }
+                for t in [&by_cpu, &by_card] {
+                    list.list.ResourceBarrier(&[crate::host::transition(t, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                }
+                for (t, (back, _)) in [&by_cpu, &by_card].into_iter().zip(&backs) {
+                    for (i, f) in footprints.iter().enumerate() {
+                        list.list.CopyTextureRegion(&location(back, Some(*f), 0), 0, 0, 0, &location(t, None, i as u32), None);
+                    }
+                }
+            }
+            list.close();
+            host.execute(&[&list]);
+            list.reset();
+            for (i, f) in footprints.iter().enumerate() {
+                let pitch = f.Footprint.RowPitch as usize;
+                let bytes = (f.Footprint.Width.div_ceil(block) * bpe) as usize;
+                for z in 0..f.Footprint.Depth as usize {
+                    for y in 0..rows[i] as usize {
+                        let at = f.Offset as usize + (z * rows[i] as usize + y) * pitch;
+                        // SAFETY: mapped read-back buffers of `total` bytes; the list has run.
+                        let (a, b) = unsafe {
+                            (
+                                std::slice::from_raw_parts(backs[0].1.add(at), bytes),
+                                std::slice::from_raw_parts(backs[1].1.add(at), bytes),
+                            )
+                        };
+                        assert_eq!(a, b, "{format:?} {swizzle:?} {dimension:?} {w}x{h}x{depth} subresource {i} z {z} row {y}");
+                    }
+                }
+                compared += 1;
+            }
+            drop((cpu_staging, gpu_staging, by_cpu, by_card, backs, card_rows));
+        }
+        assert!(compared >= 40, "{compared} subresources compared");
     }
 
     /// Elements of 1 or 2 bytes stay with the processor.

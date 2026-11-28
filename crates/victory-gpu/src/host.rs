@@ -1324,7 +1324,7 @@ pub(crate) struct HostList {
 }
 
 /// A list's prelude: an allocator and a closed list.
-type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+pub(crate) type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 
 /// State preludes belong to the host queue while submitted. Only completed
 /// pairs may be reset and recorded again.
@@ -2439,6 +2439,9 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// The detiling of the textures the list uploads, on the card
+    /// (`VICTORY_GPU_DETILE=1`): a side list run just ahead of the list.
+    detile: Option<crate::texture::detile_gpu::Work>,
 }
 
 impl Deferred {
@@ -4180,7 +4183,7 @@ impl Host {
     }
 
     /// An allocator and a closed list for a prelude.
-    fn make_prelude(&self) -> Option<Prelude> {
+    pub(crate) fn make_prelude(&self) -> Option<Prelude> {
         // SAFETY: plain object creation.
         let made: windows::core::Result<Prelude> = unsafe {
             (|| {
@@ -5846,6 +5849,14 @@ impl Host {
         crate::descriptor::make_waiting();
         #[cfg(feature = "diagnostics")]
         split.part(15);
+        // The detiling of textures on the card (`VICTORY_GPU_DETILE=1`):
+        // after the refreshes filled the staging buffers, in a queue call
+        // of its own ahead of the lists, whose copies read its rows.
+        let detiles: Vec<Option<ID3D12CommandList>> = runs.iter().filter_map(|list| list.detile_list()).map(Some).collect();
+        if !detiles.is_empty() {
+            // SAFETY: closed side lists; what they name is held by their lists.
+            unsafe { self.queue.ExecuteCommandLists(&detiles) };
+        }
         let prepared = std::time::Instant::now();
         stage.next("submit: sending");
         // When it runs on the card, for the timeline.
@@ -6446,6 +6457,9 @@ impl HostList {
                 self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
+        }
+        if let Some(work) = self.deferred().detile.as_mut() {
+            work.close();
         }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
@@ -7401,6 +7415,22 @@ impl HostList {
     /// next clamp moves it back to unordered access.
     pub(crate) fn indirect_readable(&self, scratch: &ID3D12Resource) {
         self.deferred().indirect_readable = scratch.as_raw() as usize;
+    }
+
+    /// `f` with the list's side list for detiling on the card, made on
+    /// first use ([`crate::texture::detile_gpu`]).
+    pub(crate) fn detile_work<R>(&self, f: impl FnOnce(&Host, &mut crate::texture::detile_gpu::Work) -> Option<R>) -> Option<R> {
+        let host = host()?;
+        let mut deferred = self.deferred();
+        if deferred.detile.is_none() {
+            deferred.detile = Some(crate::texture::detile_gpu::Work::new(host)?);
+        }
+        f(host, deferred.detile.as_mut()?)
+    }
+
+    /// The closed side list that detiles this list's textures, if any.
+    fn detile_list(&self) -> Option<ID3D12CommandList> {
+        self.deferred().detile.as_ref()?.list()
     }
 
     /// Keeps `object` alive until the list is reset.
